@@ -11,19 +11,20 @@ OWNER = int(environ.get("OWNER", "1786342431"))
 CREDIT = environ.get("CREDIT", '<a href="https://t.me/Jetha_lal_bot">𝄟⃝🐬🅹🅰🅸 🆂🅷🆁🅸 🆁🅰🅼 ⚡️ 𝄟⃝🐬 💻</a>')
 cookies_file_path = os.getenv("cookies_file_path", "youtube_cookies.txt")
 
-TOTAL_USER = os.environ.get('TOTAL_USERS', '')
+TOTAL_USER = os.environ.get("TOTAL_USERS", "")
 TOTAL_USERS = [
     int(user_id.strip())
-    for user_id in TOTAL_USER.split(',')
+    for user_id in TOTAL_USER.split(",")
     if user_id.strip()
 ]
 
-AUTH_USER = os.environ.get('AUTH_USERS', '')
+AUTH_USER = os.environ.get("AUTH_USERS", "")
 AUTH_USERS = [
     int(user_id.strip())
-    for user_id in AUTH_USER.split(',')
+    for user_id in AUTH_USER.split(",")
     if user_id.strip()
 ]
+
 if int(OWNER) not in AUTH_USERS:
     AUTH_USERS.append(int(OWNER))
   
