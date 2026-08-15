@@ -370,22 +370,74 @@ def download_drago_mkv(url: str, filename: str, ext: str) -> str | None:
         print(f"⚠️ Download interrupted (resume enabled): {e}")
         return file_path if os.path.exists(file_path) else None
 
-def download_drago_mkv(url: str, name: str) -> str | None:
+def download_drago_mkv(url: str, name: str, ext: str = None) -> str | None:
+    """Download AppX video files, including signed .zip URLs.
 
-    # 🔹 resolve redirect
-    r = requests.get(url, allow_redirects=True, timeout=15)
-    final_url = r.url
+    The signed URL has query parameters, so checking url.endswith(".zip")
+    is unreliable. Inspect the URL path instead.
+    """
+    try:
+        parsed = urlparse(url)
+        path_ext = os.path.splitext(parsed.path)[1].lower()
 
-    # 🔹 ZIP case
-    if final_url.endswith(".zip"):
-        zip_path = download_raw_file(final_url, name, "zip")
-        folder = extract_zip(zip_path)
-        return merge_ts_files(folder, f"downloads/{name}.mp4")
+        # Preserve an explicitly supplied extension, otherwise use the URL.
+        actual_ext = (ext or path_ext.lstrip(".") or "mkv").lower()
 
-    # 🔹 MKV (encrypted) case
-    else:
-        return download_raw_file(final_url, name, "mkv")
-    
+        # Download the archive/file first.
+        downloaded_path = download_raw_file(url, name)
+
+        if not downloaded_path or not os.path.isfile(downloaded_path):
+            print(
+                f"❌ Raw video download returned no file: "
+                f"{downloaded_path!r}"
+            )
+            return None
+
+        if os.path.getsize(downloaded_path) == 0:
+            print("❌ Raw video download created an empty file.")
+            return None
+
+        # Signed static-trans links commonly contain a ZIP archive.
+        if actual_ext == "zip" or path_ext == ".zip":
+            # download_raw_file currently stores its output as .mkv.
+            # Rename it to .zip before extraction.
+            zip_path = downloaded_path
+            if not zip_path.lower().endswith(".zip"):
+                zip_path = os.path.splitext(zip_path)[0] + ".zip"
+                os.replace(downloaded_path, zip_path)
+
+            print(
+                f"📦 Extracting video archive: {zip_path} "
+                f"({os.path.getsize(zip_path)} bytes)"
+            )
+
+            folder = extract_zip(zip_path)
+            output = f"downloads/{name}.mp4"
+
+            result = merge_ts_files(folder, output)
+
+            if (
+                result
+                and os.path.isfile(result)
+                and os.path.getsize(result) > 0
+            ):
+                print(
+                    f"✅ ZIP video merged: {result} "
+                    f"({os.path.getsize(result)} bytes)"
+                )
+                return result
+
+            print("❌ ZIP archive contained no usable TS video.")
+            return None
+
+        return downloaded_path
+
+    except Exception as e:
+        print(f"❌ download_drago_mkv failed: {e}")
+        logging.exception("download_drago_mkv failed")
+        return None
+
+
 def human_readable_size(size, decimal_places=2):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
         if size < 1024.0 or unit == 'PB':
@@ -401,7 +453,7 @@ def time_name():
     return f"{date} {current_time}.mp4"
 
 import os, re, asyncio, aiohttp
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 async def fetch_segment(session, seg_url, headers):
     async with session.get(seg_url, headers=headers, timeout=30) as resp:
@@ -411,7 +463,7 @@ async def fetch_segment(session, seg_url, headers):
 import aiohttp
 import asyncio
 import os
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 async def fetch_segment(session, seg_url, f):
     async with session.get(seg_url) as resp:
