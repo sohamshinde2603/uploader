@@ -371,72 +371,160 @@ def download_drago_mkv(url: str, filename: str, ext: str) -> str | None:
         return file_path if os.path.exists(file_path) else None
 
 def download_drago_mkv(url: str, name: str, ext: str = None) -> str | None:
-    """Download AppX video files, including signed .zip URLs.
-
-    The signed URL has query parameters, so checking url.endswith(".zip")
-    is unreliable. Inspect the URL path instead.
-    """
+    """Download signed AppX video ZIPs and turn their TS segments into MP4."""
     try:
         parsed = urlparse(url)
         path_ext = os.path.splitext(parsed.path)[1].lower()
-
-        # Preserve an explicitly supplied extension, otherwise use the URL.
         actual_ext = (ext or path_ext.lstrip(".") or "mkv").lower()
 
-        # Download the archive/file first.
-        downloaded_path = download_raw_file(url, name)
+        os.makedirs("downloads", exist_ok=True)
 
-        if not downloaded_path or not os.path.isfile(downloaded_path):
-            print(
-                f"❌ Raw video download returned no file: "
-                f"{downloaded_path!r}"
-            )
-            return None
-
-        if os.path.getsize(downloaded_path) == 0:
-            print("❌ Raw video download created an empty file.")
-            return None
-
-        # Signed static-trans links commonly contain a ZIP archive.
+        # Signed static-trans URLs are ZIP archives. Download them directly
+        # to a real .zip file; do not use the legacy .mkv raw downloader.
         if actual_ext == "zip" or path_ext == ".zip":
-            # download_raw_file currently stores its output as .mkv.
-            # Rename it to .zip before extraction.
-            zip_path = downloaded_path
-            if not zip_path.lower().endswith(".zip"):
-                zip_path = os.path.splitext(zip_path)[0] + ".zip"
-                os.replace(downloaded_path, zip_path)
+            zip_path = os.path.join("downloads", f"{name}.zip")
+            extract_dir = os.path.join("downloads", f"{name}_extract")
+            output_path = os.path.join("downloads", f"{name}.mp4")
 
-            print(
-                f"📦 Extracting video archive: {zip_path} "
-                f"({os.path.getsize(zip_path)} bytes)"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13)",
+                "Referer": "https://akstechnicalclasses.classx.co.in/",
+                "Origin": "https://akstechnicalclasses.classx.co.in",
+                "Accept": "*/*",
+                "Connection": "keep-alive",
+            }
+
+            print(f"📦 Downloading signed ZIP: {url}")
+
+            # Always start clean. A previous partial ZIP must never be
+            # appended to a new signed URL.
+            for old in (zip_path, output_path):
+                try:
+                    if os.path.isfile(old):
+                        os.remove(old)
+                except OSError:
+                    pass
+
+            response = requests.get(
+                url,
+                headers=headers,
+                stream=True,
+                timeout=(20, 300),
+                allow_redirects=True,
             )
+            print(f"📦 ZIP HTTP status: {response.status_code}")
+            response.raise_for_status()
 
-            folder = extract_zip(zip_path)
-            output = f"downloads/{name}.mp4"
+            total = 0
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        total += len(chunk)
 
-            result = merge_ts_files(folder, output)
+            response.close()
+
+            print(f"📦 ZIP downloaded: {total} bytes")
+
+            if total == 0 or not os.path.isfile(zip_path):
+                print("❌ Signed ZIP response was empty.")
+                return None
+
+            # A ZIP starts with PK. ZipFile gives a stronger validation.
+            if not zipfile.is_zipfile(zip_path):
+                with open(zip_path, "rb") as f:
+                    prefix = f.read(64)
+                print(
+                    "❌ Response is not a valid ZIP. "
+                    f"Content-Type={response.headers.get('Content-Type')}; "
+                    f"starts={prefix!r}"
+                )
+                return None
+
+            # Remove an old extraction directory.
+            if os.path.isdir(extract_dir):
+                shutil.rmtree(extract_dir)
+
+            os.makedirs(extract_dir, exist_ok=True)
+
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(extract_dir)
+
+            # Find TS/TSE files recursively. Some AppX archives contain
+            # subdirectories rather than placing the segments at the root.
+            ts_files = []
+            for root, _, files in os.walk(extract_dir):
+                for filename in files:
+                    if filename.lower().endswith((".ts", ".tse")):
+                        ts_files.append(os.path.join(root, filename))
+
+            if not ts_files:
+                print("❌ ZIP contains no .ts/.tse video segments.")
+                return None
+
+            # Sort naturally by numeric parts where possible.
+            def segment_key(path):
+                base = os.path.basename(path)
+                parts = re.split(r"(\d+)", base)
+                return [
+                    int(x) if x.isdigit() else x.lower()
+                    for x in parts
+                ]
+
+            ts_files.sort(key=segment_key)
+
+            list_file = os.path.join(extract_dir, "list.txt")
+            with open(list_file, "w", encoding="utf-8") as f:
+                for segment in ts_files:
+                    # concat demuxer requires escaped single quotes.
+                    safe = os.path.abspath(segment).replace("'", r"'\''")
+                    f.write(f"file '{safe}'\n")
+
+            print(f"🎬 Merging {len(ts_files)} video segments...")
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    list_file,
+                    "-c",
+                    "copy",
+                    output_path,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
 
             if (
-                result
-                and os.path.isfile(result)
-                and os.path.getsize(result) > 0
+                os.path.isfile(output_path)
+                and os.path.getsize(output_path) > 0
             ):
                 print(
-                    f"✅ ZIP video merged: {result} "
-                    f"({os.path.getsize(result)} bytes)"
+                    f"✅ Final MP4: {output_path} "
+                    f"({os.path.getsize(output_path)} bytes)"
                 )
-                return result
+                return output_path
 
-            print("❌ ZIP archive contained no usable TS video.")
+            print("❌ FFmpeg did not create a valid MP4.")
             return None
 
-        return downloaded_path
+        # Non-ZIP fallback.
+        return download_raw_file(url, name)
 
-    except Exception as e:
-        print(f"❌ download_drago_mkv failed: {e}")
-        logging.exception("download_drago_mkv failed")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ FFmpeg merge failed: {e.stderr[-4000:] if e.stderr else e}")
         return None
-
+    except Exception as e:
+        print(f"❌ Signed video download failed: {type(e).__name__}: {e}")
+        logging.exception("Signed video download failed")
+        return None
 
 def human_readable_size(size, decimal_places=2):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
@@ -546,7 +634,10 @@ async def download_video(url, cmd, name):
                 )
                 return result
 
-            print("❌ AppX ZIP download/extraction produced no video.")
+            print(
+                "❌ AppX ZIP route returned no usable video. "
+                "See signed-video/FFmpeg logs above."
+            )
             return None
 
         # Transcoded links are direct HLS/M3U8 links in this project.
