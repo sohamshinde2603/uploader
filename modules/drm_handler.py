@@ -557,18 +557,34 @@ async def drm_handler(bot: Client, m: Message):
                             # Do NOT request that /dl endpoint again: it is the
                             # endpoint that is returning HTTP 500. Extract the
                             # underlying signed static-db-v2 URL instead.
+                            # The /dl wrapper contains both the real
+                            # signed URL and the XOR key used for the
+                            # encrypted PDF payload.
+                            decrypt_key = None
+
                             if (
                                 "appxsignurlbyvip.vercel.app/dl" in pdf_url
                             ):
                                 parsed = urlparse(pdf_url)
                                 query = parse_qs(parsed.query)
 
-                                underlying_url = query.get("url", [None])[0]
+                                underlying_url = query.get(
+                                    "url", [None]
+                                )[0]
+                                decrypt_key = query.get(
+                                    "key", [None]
+                                )[0]
 
                                 if not underlying_url:
                                     raise ValueError(
                                         "The AppX /dl response did not contain "
                                         "an underlying url parameter."
+                                    )
+
+                                if not decrypt_key:
+                                    raise ValueError(
+                                        "The AppX /dl response did not contain "
+                                        "the PDF decryption key."
                                     )
 
                                 final_pdf_url = underlying_url
@@ -578,6 +594,10 @@ async def drm_handler(bot: Client, m: Message):
                             print(
                                 "APPX FINAL PDF URL:",
                                 final_pdf_url
+                            )
+                            print(
+                                "APPX ENCRYPTED:",
+                                bool(decrypt_key)
                             )
 
                             pdf_response = requests.get(
@@ -617,7 +637,27 @@ async def drm_handler(bot: Client, m: Message):
 
                             pdf_response.raise_for_status()
 
-                            pdf_data = pdf_response.content
+                            pdf_data = bytearray(pdf_response.content)
+
+                            # AppX encrypted PDFs have their first 28 bytes
+                            # XOR-obfuscated. The /dl response supplies the
+                            # key. This is the same decrypt scheme present
+                            # in the supplied project helper.
+                            if not bytes(pdf_data).startswith(b"%PDF-"):
+                                if decrypt_key:
+                                    key_bytes = decrypt_key.encode()
+
+                                    decrypt_size = min(
+                                        28, len(pdf_data)
+                                    )
+
+                                    for j in range(decrypt_size):
+                                        if j < len(key_bytes):
+                                            pdf_data[j] ^= key_bytes[j]
+                                        else:
+                                            pdf_data[j] ^= j
+
+                            pdf_data = bytes(pdf_data)
 
                             if not pdf_data.startswith(b"%PDF-"):
                                 preview = pdf_data[:300].decode(
@@ -625,8 +665,8 @@ async def drm_handler(bot: Client, m: Message):
                                     errors="replace"
                                 )
                                 raise ValueError(
-                                    "The underlying AppX URL did not return "
-                                    "a valid PDF. "
+                                    "The underlying AppX response could not "
+                                    "be decoded into a valid PDF. "
                                     f"Content-Type="
                                     f"{pdf_response.headers.get('Content-Type')}; "
                                     f"Response starts with: {preview}"
