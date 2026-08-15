@@ -45,7 +45,7 @@ import aiofiles
 import zipfile
 import shutil
 import ffmpeg
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import base64
 
 # ---------------------------------------------------------
@@ -521,10 +521,9 @@ async def drm_handler(bot: Client, m: Message):
                     need_referer = False
                     namef = name1
 
-                    # AppX signed PDF URLs:
-                    # The first request returns JSON containing a second
-                    # "pdf_url".  The actual PDF must be downloaded from
-                    # that second URL.
+                    # -----------------------------------------------------
+                    # APPX SIGNED PDF HANDLER
+                    # -----------------------------------------------------
                     if (
                         "appxsignurl.vercel.app/appx/" in final_url
                         or "appxsignurlbyvip.vercel.app/appx/" in final_url
@@ -554,37 +553,85 @@ async def drm_handler(bot: Client, m: Message):
                                 data.get("title", name1)
                             ).strip() or name1
 
-                            # This is the important second request.
+                            # The byvip API returns /dl?url=<REAL_SIGNED_URL>&key=...
+                            # Do NOT request that /dl endpoint again: it is the
+                            # endpoint that is returning HTTP 500. Extract the
+                            # underlying signed static-db-v2 URL instead.
+                            if (
+                                "appxsignurlbyvip.vercel.app/dl" in pdf_url
+                            ):
+                                parsed = urlparse(pdf_url)
+                                query = parse_qs(parsed.query)
+
+                                underlying_url = query.get("url", [None])[0]
+
+                                if not underlying_url:
+                                    raise ValueError(
+                                        "The AppX /dl response did not contain "
+                                        "an underlying url parameter."
+                                    )
+
+                                final_pdf_url = underlying_url
+                            else:
+                                final_pdf_url = pdf_url.strip()
+
+                            print(
+                                "APPX FINAL PDF URL:",
+                                final_pdf_url
+                            )
+
                             pdf_response = requests.get(
-                                pdf_url.strip(),
+                                final_pdf_url,
                                 headers={
-                                    "User-Agent": "Mozilla/5.0",
+                                    "User-Agent": (
+                                        "Mozilla/5.0 (Linux; Android 10; K) "
+                                        "AppleWebKit/537.36 "
+                                        "(KHTML, like Gecko) "
+                                        "Chrome/120.0.0.0 Mobile Safari/537.36"
+                                    ),
                                     "Accept": "application/pdf,*/*",
-                                    "Referer": "https://player.akamai.net.in/",
+                                    "Referer": (
+                                        "https://player.akamai.net.in/"
+                                    ),
                                 },
                                 timeout=120,
                                 allow_redirects=True,
                             )
+
+                            print(
+                                "APPX FINAL STATUS:",
+                                pdf_response.status_code
+                            )
+                            print(
+                                "APPX FINAL CONTENT-TYPE:",
+                                pdf_response.headers.get("Content-Type")
+                            )
+                            print(
+                                "APPX FINAL SIZE:",
+                                len(pdf_response.content)
+                            )
+                            print(
+                                "APPX FINAL FIRST BYTES:",
+                                pdf_response.content[:20]
+                            )
+
                             pdf_response.raise_for_status()
 
                             pdf_data = pdf_response.content
 
-                            # Never save JSON/HTML/error responses as .pdf.
                             if not pdf_data.startswith(b"%PDF-"):
-                                content_type = pdf_response.headers.get(
-                                    "Content-Type", "unknown"
-                                )
                                 preview = pdf_data[:300].decode(
-                                    "utf-8", errors="replace"
+                                    "utf-8",
+                                    errors="replace"
                                 )
                                 raise ValueError(
-                                    "AppX final URL did not return a PDF. "
-                                    f"HTTP={pdf_response.status_code}, "
-                                    f"Content-Type={content_type}, "
+                                    "The underlying AppX URL did not return "
+                                    "a valid PDF. "
+                                    f"Content-Type="
+                                    f"{pdf_response.headers.get('Content-Type')}; "
                                     f"Response starts with: {preview}"
                                 )
 
-                            # Make the filename filesystem-safe.
                             safe_name = re.sub(
                                 r'[\\/:*?"<>|]',
                                 "",
@@ -595,15 +642,6 @@ async def drm_handler(bot: Client, m: Message):
 
                             with open(pdf_path, "wb") as file:
                                 file.write(pdf_data)
-
-                            # Verify the complete downloaded file before sending.
-                            if (
-                                not os.path.exists(pdf_path)
-                                or os.path.getsize(pdf_path) < 100
-                            ):
-                                raise ValueError(
-                                    "Downloaded PDF is unexpectedly small."
-                                )
 
                             await bot.send_document(
                                 chat_id=channel_id,
@@ -627,7 +665,6 @@ async def drm_handler(bot: Client, m: Message):
                                 f"<blockquote>{str(e)}</blockquote>"
                             )
 
-                        # Do not fall through to yt-dlp.
                         continue
 
                     elif "static-db.appx.co.in" in final_url:
@@ -635,11 +672,8 @@ async def drm_handler(bot: Client, m: Message):
                         namef = name1
 
                     elif "static-db-v2.appx.co.in" in final_url:
-                        filename = urlparse(final_url).path.split("/")[-1]
-                        final_url = (
-                            "https://appx-content-v2.classx.co.in/"
-                            f"paid_course4/{filename}"
-                        )
+                        # Keep the original signed static-db-v2 URL intact.
+                        # Do not replace it with a different path.
                         need_referer = True
                         namef = name1
 
