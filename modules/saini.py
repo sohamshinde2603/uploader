@@ -7,6 +7,9 @@ import aiohttp
 import aiofiles
 import asyncio
 import logging
+
+# Retry counter used by download_video()
+failed_counter = 0
 import requests
 import tgcrypto
 import subprocess
@@ -441,9 +444,12 @@ async def download_m3u8_async(url: str, filename: str):
 
         print(f"🚀 Downloading {len(segments)} segments for {filename}...")
 
+        # HLS segments MUST be written in playlist order.
+        # Concurrent writes to the same file can scramble the video.
         with open(final_file, "wb") as f:
-            tasks = [fetch_segment(session, seg_url, f) for seg_url in segments]
-            await asyncio.gather(*tasks)
+            for index, seg_url in enumerate(segments, 1):
+                print(f"📥 Downloading segment {index}/{len(segments)}")
+                await fetch_segment(session, seg_url, f)
 
         print(f"\n✅ Full video downloaded: {final_file}")
         return final_file
@@ -455,43 +461,92 @@ import asyncio
 import subprocess
 import logging
 
-
 async def download_video(url, cmd, name):
+    """Download a video and return the real file path.
+
+    Transcoded AppX M3U8 URLs use the local async M3U8 downloader.
+    All other URLs use yt-dlp. No aria2c dependency is required.
+    """
+    global failed_counter
+
     try:
+        # Transcoded links are direct HLS/M3U8 links in this project.
         if "transcoded" in url.lower():
-            print(f"⚡ Transcoded URL detected → using download_m3u8 for {name}")
-            result = download_m3u8(url, name)
-            if result and os.path.isfile(result) and os.path.getsize(result) > 0:
+            print(
+                f"⚡ Transcoded URL detected → "
+                f"using download_m3u8_async for {name}"
+            )
+
+            result = await download_m3u8_async(url, name)
+
+            if (
+                result
+                and os.path.isfile(result)
+                and os.path.getsize(result) > 0
+            ):
+                print(
+                    f"✅ M3U8 video ready: {result} "
+                    f"({os.path.getsize(result)} bytes)"
+                )
                 return result
+
             print("❌ M3U8 download did not produce a valid file.")
             return None
 
-        download_cmd = (
-            f'{cmd} -R 25 --fragment-retries 25 '
-            f'--external-downloader aria2c '
-            f'--downloader-args "aria2c: -x 16 -j 32"'
+        # Remove legacy aria2c options if an older caller still supplies them.
+        download_cmd = re.sub(
+            r'\s+--external-downloader(?:=|\s+)aria2c',
+            '',
+            cmd,
+            flags=re.IGNORECASE
+        )
+        download_cmd = re.sub(
+            r'\s+--downloader-args(?:=|\s+)"aria2c:[^"]*"',
+            '',
+            download_cmd,
+            flags=re.IGNORECASE
+        )
+        download_cmd = re.sub(
+            r"\s+--downloader-args(?:=|\s+)'aria2c:[^']*'",
+            '',
+            download_cmd,
+            flags=re.IGNORECASE
         )
 
-        global failed_counter
-        print(f"[VIDEO DOWNLOAD] {download_cmd}")
+        download_cmd = (
+            f'{download_cmd} '
+            f'--retries 25 '
+            f'--fragment-retries 25 '
+            f'--file-access-retries 25 '
+            f'--no-mtime '
+            f'--no-part '
+            f'--print after_move:filepath'
+        )
+
+        print("[VIDEO DOWNLOAD COMMAND]")
+        print(download_cmd)
         logging.info(download_cmd)
 
         process = await asyncio.create_subprocess_shell(
             download_cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
+
         stdout, stderr = await process.communicate()
 
         stdout_text = stdout.decode(errors="ignore")
         stderr_text = stderr.decode(errors="ignore")
+
+        print("[YT-DLP STDOUT]")
         print(stdout_text)
 
-        if process.returncode != 0:
-            print("[VIDEO DOWNLOAD ERROR]")
+        if stderr_text:
+            print("[YT-DLP STDERR]")
             print(stderr_text)
 
-            if "visionias" in cmd and failed_counter <= 10:
+        if process.returncode != 0:
+            if "visionias" in cmd.lower() and failed_counter < 10:
                 failed_counter += 1
                 await asyncio.sleep(5)
                 return await download_video(url, cmd, name)
@@ -501,56 +556,84 @@ async def download_video(url, cmd, name):
 
         failed_counter = 0
 
-        possible_files = [
+        # Prefer paths printed by yt-dlp.
+        candidates = []
+        for line in reversed(
+            (stdout_text + "\n" + stderr_text).splitlines()
+        ):
+            candidate = line.strip().strip('"').strip("'")
+            if (
+                candidate
+                and os.path.isfile(candidate)
+                and os.path.getsize(candidate) > 0
+            ):
+                candidates.append(candidate)
+
+        # Common names used by this bot.
+        base = os.path.splitext(name)[0]
+        candidates.extend([
             name,
             f"{name}.webm",
             f"{name}.mp4",
             f"{name}.mkv",
             f"{name}.mp4.webm",
-        ]
-
-        base = os.path.splitext(name)[0]
-        possible_files.extend([
             f"{base}.mp4",
             f"{base}.mkv",
             f"{base}.webm",
             f"{base}.mp4.webm",
         ])
 
-        for file_path in possible_files:
-            if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
-                print(
-                    f"✅ Video downloaded: {file_path} "
-                    f"({os.path.getsize(file_path)} bytes)"
-                )
-                return file_path
+        # Search downloads/ as a fallback.
+        for root in (".", "downloads"):
+            if not os.path.isdir(root):
+                continue
 
-        print("❌ yt-dlp completed but no video file was found.")
+            for dirpath, _, filenames in os.walk(root):
+                for filename in filenames:
+                    if filename.lower().endswith(
+                        (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+                    ):
+                        candidates.append(
+                            os.path.join(dirpath, filename)
+                        )
+
+        seen = set()
+        valid = []
+
+        for candidate in candidates:
+            candidate = os.path.normpath(candidate)
+
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+
+            if (
+                os.path.isfile(candidate)
+                and os.path.getsize(candidate) > 0
+            ):
+                valid.append(candidate)
+
+        if valid:
+            valid.sort(
+                key=lambda path: os.path.getmtime(path),
+                reverse=True
+            )
+            result = valid[0]
+            print(
+                f"✅ Video downloaded: {result} "
+                f"({os.path.getsize(result)} bytes)"
+            )
+            return result
+
+        print("❌ yt-dlp finished but no video file was found.")
+        print(f"[VIDEO] Expected name: {name}")
         return None
 
     except Exception as e:
         print(f"❌ Video download exception: {e}")
+        logging.exception("Video download exception")
         return None
 
-import os
-import os
-import time
-import mmap
-import asyncio
-import requests
-import subprocess
-
-from tqdm import tqdm
-from pyrogram import Client
-from pyrogram.types import Message
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import requests
-import os
-from tqdm import tqdm
-import os
-import requests
-from tqdm import tqdm  # progress bar
 def create_session():
     session = requests.Session()
     retries = Retry(
@@ -696,25 +779,13 @@ import time
 import asyncio
 
 # 🔹 Async ffmpeg runner (NO BLOCKING)
-
 async def run_cmd(cmd: str):
     process = await asyncio.create_subprocess_shell(
         cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
     )
-
-    stdout, stderr = await process.communicate()
-
-    stdout_text = stdout.decode(errors="ignore")
-    stderr_text = stderr.decode(errors="ignore")
-
-    if process.returncode != 0:
-        print("========== FFMPEG ERROR ==========")
-        print(stderr_text)
-        print("===================================")
-
-    return process.returncode, stdout_text, stderr_text
+    await process.communicate()
 
 
 async def send_vid(
@@ -728,232 +799,89 @@ async def send_vid(
     prog,
     channel_id
 ):
-    thumb_path = f"{filename}.jpg" if filename else None
-    w_filename = filename
+    # ==========================
+    # THUMBNAIL GENERATION
+    # ==========================
+    thumb_path = f"{filename}.jpg"
+    await run_cmd(
+        f'ffmpeg -y -i "{filename}" -ss 00:00:10 -vframes 1 "{thumb_path}"'
+    )
 
+    await prog.delete(True)
+
+    reply1 = await bot.send_message(
+        channel_id,
+        f"**📩 Uploading Video 📩:-**\n<blockquote>**{name}**</blockquote>"
+    )
+
+    reply = await m.reply_text(
+        f"**Generate Thumbnail:**\n<blockquote>**{name}**</blockquote>"
+    )
+
+    # ==========================
+    # THUMB SELECTION
+    # ==========================
+    thumbnail = thumb_path if thumb == "/d" else thumb
+
+    # ==========================
+    # WATERMARK PROCESS
+    # ==========================
+    if vidwatermark == "/d":
+        w_filename = filename
+    else:
+        w_filename = f"w_{os.path.basename(filename)}"
+        font_path = "vidwater.ttf"
+
+        await run_cmd(
+            f'ffmpeg -y -i "{filename}" -vf '
+            f'"drawtext=fontfile={font_path}:text=\'{vidwatermark}\':'
+            f'fontcolor=white@0.3:fontsize=h/6:'
+            f'x=(w-text_w)/2:y=(h-text_h)/2" '
+            f'-codec:a copy "{w_filename}"'
+        )
+
+    # ==========================
+    # SAFETY CHECK
+    # ==========================
+    if not os.path.exists(w_filename):
+        await m.reply_text("❌ Video processing failed")
+        return
+
+    dur = int(duration(w_filename))
+    start_time = time.time()
+
+    # ==========================
+    # UPLOAD (VIDEO → DOC FALLBACK)
+    # ==========================
     try:
-        # -----------------------------
-        # Check downloaded video
-        # -----------------------------
-        if not filename:
-            await m.reply_text("❌ Video download failed.")
-            return
-
-        if not os.path.isfile(filename):
-            await m.reply_text(
-                f"❌ Video file not found:\n`{filename}`"
-            )
-            print(f"[VIDEO] Missing file: {filename}")
-            return
-
-        if os.path.getsize(filename) == 0:
-            await m.reply_text("❌ Downloaded video is empty.")
-            return
-
-        print(
-            f"[VIDEO] Input: {filename} | "
-            f"{os.path.getsize(filename)} bytes"
+        await bot.send_video(
+            chat_id=channel_id,
+            video=w_filename,
+            caption=cc,
+            supports_streaming=True,
+            height=720,
+            width=1280,
+            thumb=thumbnail,
+            duration=dur,
+            progress=progress_bar,
+            progress_args=(reply, start_time)
+        )
+    except Exception:
+        await bot.send_document(
+            chat_id=channel_id,
+            document=w_filename,
+            caption=cc,
+            progress=progress_bar,
+            progress_args=(reply, start_time)
         )
 
-        # -----------------------------
-        # Thumbnail
-        # -----------------------------
-        thumbnail = None
-        thumb_cmd = (
-            f'ffmpeg -y -ss 00:00:05 -i "{filename}" '
-            f'-frames:v 1 -q:v 2 "{thumb_path}"'
-        )
-
-        thumb_rc, _, thumb_err = await run_cmd(thumb_cmd)
-
-        if thumb_rc == 0 and os.path.isfile(thumb_path):
-            thumbnail = thumb_path if thumb == "/d" else thumb
-        else:
-            print("[VIDEO] Thumbnail generation failed:")
-            print(thumb_err)
-            # Thumbnail failure must NOT stop video upload.
-            thumbnail = None if thumb == "/d" else thumb
-
-        try:
-            if prog:
-                await prog.delete(True)
-        except Exception:
-            pass
-
-        reply1 = await bot.send_message(
-            channel_id,
-            f"**📩 Uploading Video 📩:-**\n"
-            f"<blockquote>**{name}**</blockquote>"
-        )
-
-        reply = await m.reply_text(
-            f"**Uploading Video:**\n"
-            f"<blockquote>**{name}**</blockquote>"
-        )
-
-        # -----------------------------
-        # Watermark
-        # -----------------------------
-        if vidwatermark != "/d":
-            font_path = "vidwater.ttf"
-
-            if os.path.isfile(font_path):
-                w_filename = os.path.join(
-                    os.path.dirname(filename),
-                    f"w_{os.path.basename(filename)}"
-                )
-
-                safe_text = str(vidwatermark)
-                safe_text = safe_text.replace("\\", "\\\\")
-                safe_text = safe_text.replace("'", "\\'")
-                safe_text = safe_text.replace(":", "\\:")
-
-                watermark_cmd = (
-                    f'ffmpeg -y -i "{filename}" '
-                    f'-vf "drawtext=fontfile={font_path}:'
-                    f"text='{safe_text}':"
-                    f'fontcolor=white@0.3:fontsize=h/6:'
-                    f'x=(w-text_w)/2:y=(h-text_h)/2" '
-                    f'-c:a copy "{w_filename}"'
-                )
-
-                wm_rc, _, wm_err = await run_cmd(watermark_cmd)
-
-                if (
-                    wm_rc != 0
-                    or not os.path.isfile(w_filename)
-                    or os.path.getsize(w_filename) == 0
-                ):
-                    print("[VIDEO] Watermark processing failed:")
-                    print(wm_err)
-
-                    # Fall back to original video.
-                    w_filename = filename
-            else:
-                print(
-                    "[VIDEO] vidwater.ttf not found. "
-                    "Uploading original video."
-                )
-
-        # -----------------------------
-        # Final safety check
-        # -----------------------------
-        if not os.path.isfile(w_filename):
-            await m.reply_text(
-                "❌ Video processing failed: output file missing."
-            )
-            return
-
-        if os.path.getsize(w_filename) == 0:
-            await m.reply_text(
-                "❌ Video processing failed: output file is empty."
-            )
-            return
-
-        print(
-            f"[VIDEO] Final file: {w_filename} | "
-            f"{os.path.getsize(w_filename)} bytes"
-        )
-
-        # -----------------------------
-        # Duration
-        # -----------------------------
-        try:
-            dur = int(duration(w_filename))
-        except Exception as e:
-            print(f"[VIDEO] Duration detection failed: {e}")
-            dur = 0
-
-        start_time = time.time()
-
-        # -----------------------------
-        # Upload
-        # -----------------------------
-        try:
-            send_kwargs = {
-                "chat_id": channel_id,
-                "video": w_filename,
-                "caption": cc,
-                "supports_streaming": True,
-                "duration": dur if dur > 0 else None,
-                "progress": progress_bar,
-                "progress_args": (reply, start_time),
-            }
-
-            if thumbnail and os.path.isfile(thumbnail):
-                send_kwargs["thumb"] = thumbnail
-
-            await bot.send_video(**send_kwargs)
-            print("[VIDEO] Upload successful.")
-
-        except Exception as video_error:
-            print(f"[VIDEO] send_video failed: {video_error}")
-            print("[VIDEO] Falling back to send_document.")
-
-            await bot.send_document(
-                chat_id=channel_id,
-                document=w_filename,
-                caption=cc,
-                progress=progress_bar,
-                progress_args=(reply, start_time),
-            )
-
-        # -----------------------------
-        # Cleanup
-        # -----------------------------
-        try:
-            if (
-                thumb_path
-                and os.path.isfile(thumb_path)
-            ):
-                os.remove(thumb_path)
-        except Exception as e:
-            print(f"[VIDEO] Thumbnail cleanup failed: {e}")
-
-        try:
-            if (
-                w_filename != filename
-                and os.path.isfile(w_filename)
-            ):
-                os.remove(w_filename)
-        except Exception as e:
-            print(f"[VIDEO] Watermarked file cleanup failed: {e}")
-
-        try:
-            await reply.delete(True)
-        except Exception:
-            pass
-
-        try:
-            await reply1.delete(True)
-        except Exception:
-            pass
-
-    except Exception as e:
-        print("[SEND_VID ERROR]")
-        print(repr(e))
-
-        try:
-            await m.reply_text(
-                f"❌ **Video processing failed**\n\n"
-                f"`{str(e)}`"
-            )
-        except Exception:
-            pass
-
-        # Clean up partial output if present.
-        try:
-            if (
-                w_filename
-                and w_filename != filename
-                and os.path.isfile(w_filename)
-            ):
-                os.remove(w_filename)
-        except Exception:
-            pass
-
-        try:
-            if thumb_path and os.path.isfile(thumb_path):
-                os.remove(thumb_path)
-        except Exception:
-            pass
+    # ==========================
+    # CLEANUP
+    # ==========================
+    
+    except Exception:
+        await bot.send_document(channel_id, w_filename, caption=cc, progress=progress_bar, progress_args=(reply, start_time))
+    os.remove(w_filename)
+    await reply.delete(True)
+    await reply1.delete(True)
+    os.remove(f"{filename}.jpg")
