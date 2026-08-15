@@ -457,135 +457,38 @@ import logging
 
 
 async def download_video(url, cmd, name):
-    print("========== DOWNLOAD_VIDEO CALLED ==========")
-    print(f"[VIDEO] URL: {url}")
-    print(f"[VIDEO] Name: {name}")
-    print(f"[VIDEO] CMD: {cmd}")
-    print("===========================================")
-
-    """
-    Reliable video downloader.
-
-    M3U8/HLS URLs are handled by FFmpeg directly so HLS segments are
-    processed in the correct order. Other URLs continue through yt-dlp.
-    No aria2c dependency is required.
-    """
     try:
-        os.makedirs("downloads", exist_ok=True)
-
-        base_name = os.path.splitext(os.path.basename(name))[0]
-        output_path = os.path.abspath(
-            os.path.join("downloads", f"{base_name}.mp4")
-        )
-
-        # -------------------------------------------------
-        # M3U8 / HLS
-        # -------------------------------------------------
-        if ".m3u8" in url.lower():
-            print(f"[VIDEO] M3U8 detected: {url}")
-            print(f"[VIDEO] Output: {output_path}")
-
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except Exception:
-                    pass
-
-            headers = (
-                "User-Agent: Mozilla/5.0\r\n"
-                "Referer: https://player.akamai.net.in/\r\n"
-                "Origin: https://player.akamai.net.in\r\n"
-                "Accept: */*\r\n"
-            )
-
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-y",
-                "-loglevel", "warning",
-                "-headers", headers,
-                "-i", url,
-                "-c", "copy",
-                "-movflags", "+faststart",
-                output_path,
-            ]
-
-            print("[VIDEO] Running FFmpeg for HLS/M3U8")
-
-            process = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            stdout, stderr = await process.communicate()
-
-            stdout_text = stdout.decode(errors="ignore")
-            stderr_text = stderr.decode(errors="ignore")
-
-            if stdout_text:
-                print("[FFMPEG STDOUT]")
-                print(stdout_text)
-
-            if stderr_text:
-                print("[FFMPEG STDERR]")
-                print(stderr_text)
-
-            if (
-                process.returncode == 0
-                and os.path.isfile(output_path)
-                and os.path.getsize(output_path) > 0
-            ):
-                print(
-                    f"OK M3U8 video downloaded: {output_path} "
-                    f"({os.path.getsize(output_path)} bytes)"
-                )
-                return output_path
-
-            print(
-                f"FFmpeg failed for M3U8. "
-                f"returncode={process.returncode}"
-            )
-
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except Exception:
-                    pass
-
+        if "transcoded" in url.lower():
+            print(f"⚡ Transcoded URL detected → using download_m3u8 for {name}")
+            result = download_m3u8(url, name)
+            if result and os.path.isfile(result) and os.path.getsize(result) > 0:
+                return result
+            print("❌ M3U8 download did not produce a valid file.")
             return None
 
-        # -------------------------------------------------
-        # NORMAL YT-DLP DOWNLOAD
-        # -------------------------------------------------
-        global failed_counter
-
         download_cmd = (
-            f'{cmd} '
-            f'--retries 25 '
-            f'--fragment-retries 25 '
-            f'--file-access-retries 25 '
-            f'--no-mtime'
+            f'{cmd} -R 25 --fragment-retries 25 '
+            f'--external-downloader aria2c '
+            f'--downloader-args "aria2c: -x 16 -j 32"'
         )
 
-        print("[VIDEO DOWNLOAD COMMAND]")
-        print(download_cmd)
+        global failed_counter
+        print(f"[VIDEO DOWNLOAD] {download_cmd}")
+        logging.info(download_cmd)
 
         process = await asyncio.create_subprocess_shell(
             download_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-
         stdout, stderr = await process.communicate()
 
         stdout_text = stdout.decode(errors="ignore")
         stderr_text = stderr.decode(errors="ignore")
-
-        print("[YT-DLP STDOUT]")
         print(stdout_text)
 
         if process.returncode != 0:
-            print("[YT-DLP STDERR]")
+            print("[VIDEO DOWNLOAD ERROR]")
             print(stderr_text)
 
             if "visionias" in cmd and failed_counter <= 10:
@@ -600,14 +503,13 @@ async def download_video(url, cmd, name):
 
         possible_files = [
             name,
+            f"{name}.webm",
             f"{name}.mp4",
             f"{name}.mkv",
-            f"{name}.webm",
             f"{name}.mp4.webm",
         ]
 
         base = os.path.splitext(name)[0]
-
         possible_files.extend([
             f"{base}.mp4",
             f"{base}.mkv",
@@ -616,26 +518,18 @@ async def download_video(url, cmd, name):
         ])
 
         for file_path in possible_files:
-            if (
-                os.path.isfile(file_path)
-                and os.path.getsize(file_path) > 0
-            ):
+            if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
                 print(
-                    f"OK Video downloaded: {file_path} "
+                    f"✅ Video downloaded: {file_path} "
                     f"({os.path.getsize(file_path)} bytes)"
                 )
                 return file_path
 
-        print("yt-dlp completed but no output video was found.")
-        print(f"[VIDEO] Expected name: {name}")
-        print("[YT-DLP STDERR]")
-        print(stderr_text)
-
+        print("❌ yt-dlp completed but no video file was found.")
         return None
 
     except Exception as e:
-        print(f"Video download exception: {e}")
-        logging.exception("Video download exception")
+        print(f"❌ Video download exception: {e}")
         return None
 
 import os
@@ -807,7 +701,7 @@ async def run_cmd(cmd: str):
     process = await asyncio.create_subprocess_shell(
         cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
     )
 
     stdout, stderr = await process.communicate()
@@ -838,77 +732,21 @@ async def send_vid(
     w_filename = filename
 
     try:
-        # Check that the downloader produced a file.
-        # Some download paths return a relative/old filename while the
-        # actual file is written inside ./downloads, so try that directory
-        # before declaring the download failed.
-        if not filename or not os.path.isfile(filename):
-            print("========== VIDEO DEBUG ==========")
-            print(f"[VIDEO] Returned filename: {filename!r}")
-            print(f"[VIDEO] Current directory: {os.getcwd()}")
+        # -----------------------------
+        # Check downloaded video
+        # -----------------------------
+        if not filename:
+            await m.reply_text("❌ Video download failed.")
+            return
 
-            candidates = []
+        if not os.path.isfile(filename):
+            await m.reply_text(
+                f"❌ Video file not found:\n`{filename}`"
+            )
+            print(f"[VIDEO] Missing file: {filename}")
+            return
 
-            for folder in (".", "downloads", "/tmp"):
-                if os.path.isdir(folder):
-                    try:
-                        for entry in os.scandir(folder):
-                            if not entry.is_file():
-                                continue
-
-                            lower = entry.name.lower()
-                            if lower.endswith(
-                                (".mp4", ".mkv", ".webm", ".mov", ".ts")
-                            ):
-                                candidates.append(
-                                    (
-                                        entry.stat().st_mtime,
-                                        entry.path,
-                                        entry.stat().st_size,
-                                    )
-                                )
-                    except Exception as scan_error:
-                        print(
-                            f"[VIDEO] Directory scan failed for "
-                            f"{folder}: {scan_error}"
-                        )
-
-            candidates.sort(reverse=True)
-
-            fallback = None
-            for mtime, path, size in candidates:
-                if size > 0:
-                    fallback = path
-                    break
-
-            if fallback:
-                print(
-                    f"[VIDEO] Using fallback video file: {fallback} "
-                    f"({os.path.getsize(fallback)} bytes)"
-                )
-                filename = fallback
-                thumb_path = f"{filename}.jpg"
-                w_filename = filename
-            else:
-                print("[VIDEO] No video file was found.")
-                print("[VIDEO] Top-level files:", os.listdir("."))
-                if os.path.isdir("downloads"):
-                    print(
-                        "[VIDEO] downloads files:",
-                        os.listdir("downloads")
-                    )
-                print("================================")
-
-                await m.reply_text(
-                    "❌ **Video download failed.**\n\n"
-                    f"Returned filename: `{filename}`\n"
-                    "No video file was created."
-                )
-                return
-
-            print("================================")
-
-        if os.path.getsize(filename) <= 0:
+        if os.path.getsize(filename) == 0:
             await m.reply_text("❌ Downloaded video is empty.")
             return
 
@@ -921,7 +759,6 @@ async def send_vid(
         # Thumbnail
         # -----------------------------
         thumbnail = None
-
         thumb_cmd = (
             f'ffmpeg -y -ss 00:00:05 -i "{filename}" '
             f'-frames:v 1 -q:v 2 "{thumb_path}"'
@@ -934,12 +771,12 @@ async def send_vid(
         else:
             print("[VIDEO] Thumbnail generation failed:")
             print(thumb_err)
-
-            # Thumbnail failure must not prevent video upload.
+            # Thumbnail failure must NOT stop video upload.
             thumbnail = None if thumb == "/d" else thumb
 
         try:
-            await prog.delete(True)
+            if prog:
+                await prog.delete(True)
         except Exception:
             pass
 
@@ -985,12 +822,12 @@ async def send_vid(
                 if (
                     wm_rc != 0
                     or not os.path.isfile(w_filename)
-                    or os.path.getsize(w_filename) <= 0
+                    or os.path.getsize(w_filename) == 0
                 ):
                     print("[VIDEO] Watermark processing failed:")
                     print(wm_err)
 
-                    # Use the original downloaded video.
+                    # Fall back to original video.
                     w_filename = filename
             else:
                 print(
@@ -999,17 +836,17 @@ async def send_vid(
                 )
 
         # -----------------------------
-        # Final file check
+        # Final safety check
         # -----------------------------
         if not os.path.isfile(w_filename):
             await m.reply_text(
-                "❌ **Video processing failed:** output file missing."
+                "❌ Video processing failed: output file missing."
             )
             return
 
-        if os.path.getsize(w_filename) <= 0:
+        if os.path.getsize(w_filename) == 0:
             await m.reply_text(
-                "❌ **Video processing failed:** output file is empty."
+                "❌ Video processing failed: output file is empty."
             )
             return
 
@@ -1018,6 +855,9 @@ async def send_vid(
             f"{os.path.getsize(w_filename)} bytes"
         )
 
+        # -----------------------------
+        # Duration
+        # -----------------------------
         try:
             dur = int(duration(w_filename))
         except Exception as e:
@@ -1030,43 +870,45 @@ async def send_vid(
         # Upload
         # -----------------------------
         try:
-            kwargs = {
+            send_kwargs = {
                 "chat_id": channel_id,
                 "video": w_filename,
                 "caption": cc,
                 "supports_streaming": True,
                 "duration": dur if dur > 0 else None,
                 "progress": progress_bar,
-                "progress_args": (reply, start_time)
+                "progress_args": (reply, start_time),
             }
 
             if thumbnail and os.path.isfile(thumbnail):
-                kwargs["thumb"] = thumbnail
+                send_kwargs["thumb"] = thumbnail
 
-            await bot.send_video(**kwargs)
-
-            print("[VIDEO] send_video succeeded.")
+            await bot.send_video(**send_kwargs)
+            print("[VIDEO] Upload successful.")
 
         except Exception as video_error:
             print(f"[VIDEO] send_video failed: {video_error}")
+            print("[VIDEO] Falling back to send_document.")
 
-            # Telegram video upload fallback.
             await bot.send_document(
                 chat_id=channel_id,
                 document=w_filename,
                 caption=cc,
                 progress=progress_bar,
-                progress_args=(reply, start_time)
+                progress_args=(reply, start_time),
             )
 
         # -----------------------------
         # Cleanup
         # -----------------------------
         try:
-            if thumb_path and os.path.isfile(thumb_path):
+            if (
+                thumb_path
+                and os.path.isfile(thumb_path)
+            ):
                 os.remove(thumb_path)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[VIDEO] Thumbnail cleanup failed: {e}")
 
         try:
             if (
@@ -1074,8 +916,8 @@ async def send_vid(
                 and os.path.isfile(w_filename)
             ):
                 os.remove(w_filename)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[VIDEO] Watermarked file cleanup failed: {e}")
 
         try:
             await reply.delete(True)
@@ -1099,6 +941,7 @@ async def send_vid(
         except Exception:
             pass
 
+        # Clean up partial output if present.
         try:
             if (
                 w_filename
