@@ -521,29 +521,73 @@ async def drm_handler(bot: Client, m: Message):
                     need_referer = False
                     namef = name1
                     if "appxsignurl.vercel.app/appx/" in url:
-                        try:
-                            # Step 1: Directly use the original URL
-                            response = requests.get(url.strip(), timeout=10)
-                            data = response.json()
+    try:
+        response = requests.get(
+            url.strip(),
+            timeout=30
+        )
+        response.raise_for_status()
 
-                            # Step 2: Extract actual PDF URL
-                            pdf_url = data.get("pdf_url")
-                            if pdf_url:
-                                url = pdf_url.strip()   # overwrite with real downloadable link
-                            else:
-                                print("No pdf_url found in response JSON.")
-                                # fallback: keep original URL
-                                # url remains unchanged
+        data = response.json()
 
-                            # Step 3: Extract title if available
-                            namef = data.get("title", name1)
+        pdf_url = data.get("pdf_url")
 
-                            # Step 4: Mark referer requirement
-                            need_referer = True
-                        except Exception as e:
-                            print(f"Error fetching AppxSignURL JSON: {e}")
-                            need_referer = True
-                            namef = name1
+        if not pdf_url:
+            raise ValueError("No pdf_url found in AppX response")
+
+        pdf_url = pdf_url.strip()
+
+        namef = str(data.get("title", name1)).strip()
+
+        # Download the REAL PDF directly
+        pdf_response = requests.get(
+            pdf_url,
+            headers={
+                "Referer": "https://player.akamai.net.in/",
+                "User-Agent": "Mozilla/5.0"
+            },
+            timeout=120
+        )
+        pdf_response.raise_for_status()
+
+        pdf_data = pdf_response.content
+
+        # Verify that it is actually a PDF
+        if not pdf_data.startswith(b"%PDF-"):
+            preview = pdf_data[:150].decode(
+                "utf-8",
+                errors="replace"
+            )
+            raise ValueError(
+                f"Response is not a PDF. Starts with: {preview}"
+            )
+
+        pdf_path = f"{namef}.pdf"
+
+        with open(pdf_path, "wb") as file:
+            file.write(pdf_data)
+
+        await bot.send_document(
+            chat_id=channel_id,
+            document=pdf_path,
+            caption=cc1
+        )
+
+        count += 1
+
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+
+    except Exception as e:
+        print(f"AppX PDF error: {e}")
+
+        await m.reply_text(
+            f"⚠️ **PDF Download Failed**\n\n"
+            f"<blockquote>{str(e)}</blockquote>"
+        )
+
+    # IMPORTANT: don't let this URL continue into yt-dlp
+    continue
                     
 
                     elif "static-db.appx.co.in" in url:
