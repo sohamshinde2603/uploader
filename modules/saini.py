@@ -11,6 +11,8 @@ import logging
 # Retry counter used by download_video()
 failed_counter = 0
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import tgcrypto
 import subprocess
 import concurrent.futures
@@ -975,6 +977,11 @@ async def send_vid(
     prog,
     channel_id
 ):
+    if not filename or not os.path.isfile(filename) or os.path.getsize(filename) == 0:
+        print(f"❌ Video file missing or empty: {filename}")
+        await m.reply_text("❌ Video download failed. No video file was created.")
+        return
+
     # ==========================
     # THUMBNAIL GENERATION
     # ==========================
@@ -983,7 +990,11 @@ async def send_vid(
         f'ffmpeg -y -i "{filename}" -ss 00:00:10 -vframes 1 "{thumb_path}"'
     )
 
-    await prog.delete(True)
+    try:
+        # drm_handler may already have deleted this message.
+        await prog.delete(True)
+    except Exception:
+        pass
 
     reply1 = await bot.send_message(
         channel_id,
@@ -1054,10 +1065,12 @@ async def send_vid(
     # ==========================
     # CLEANUP
     # ==========================
-    
+    if os.path.isfile(w_filename):
+        os.remove(w_filename)
+    try:
+        await reply.delete(True)
+        await reply1.delete(True)
     except Exception:
-        await bot.send_document(channel_id, w_filename, caption=cc, progress=progress_bar, progress_args=(reply, start_time))
-    os.remove(w_filename)
-    await reply.delete(True)
-    await reply1.delete(True)
-    os.remove(f"{filename}.jpg")
+        pass
+    if os.path.isfile(thumb_path):
+        os.remove(thumb_path)
