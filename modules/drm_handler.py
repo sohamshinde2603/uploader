@@ -516,275 +516,127 @@ async def drm_handler(bot: Client, m: Message):
                     count+=1
                     os.remove(ka)
   
-                                elif ".pdf" in url:
+                elif ".pdf" in url:
                     final_url = url
                     need_referer = False
                     namef = name1
-
-                    # -------------------------------------------------
-                    # APPX SIGN URL PDF
-                    # -------------------------------------------------
                     if "appxsignurl.vercel.app/appx/" in url:
                         try:
-                            response = requests.get(
-                                url.strip(),
-                                timeout=30
-                            )
-                            response.raise_for_status()
-
+                            # Step 1: Directly use the original URL
+                            response = requests.get(url.strip(), timeout=10)
                             data = response.json()
 
+                            # Step 2: Extract actual PDF URL
                             pdf_url = data.get("pdf_url")
+                            if pdf_url:
+                                url = pdf_url.strip()   # overwrite with real downloadable link
+                            else:
+                                print("No pdf_url found in response JSON.")
+                                # fallback: keep original URL
+                                # url remains unchanged
 
-                            if not pdf_url:
-                                raise ValueError(
-                                    "AppX API did not return pdf_url"
-                                )
+                            # Step 3: Extract title if available
+                            namef = data.get("title", name1)
 
-                            pdf_url = pdf_url.strip()
-
-                            # Get title if API provides one
-                            namef = str(
-                                data.get("title") or name1
-                            ).strip()
-
-                            # Safe filename
-                            namef = re.sub(
-                                r'[\\/:*?"<>|]',
-                                '',
-                                namef
-                            )
-
-                            pdf_response = requests.get(
-                                pdf_url,
-                                headers={
-                                    "Referer": "https://player.akamai.net.in/",
-                                    "User-Agent": (
-                                        "Mozilla/5.0 "
-                                        "(Linux; Android 10; K) "
-                                        "AppleWebKit/537.36 "
-                                        "(KHTML, like Gecko) "
-                                        "Chrome/120.0.0.0 "
-                                        "Mobile Safari/537.36"
-                                    )
-                                },
-                                timeout=120
-                            )
-
-                            pdf_response.raise_for_status()
-
-                            pdf_data = pdf_response.content
-
-                            # IMPORTANT:
-                            # Make sure the response is actually a PDF
-                            if not pdf_data.startswith(b"%PDF-"):
-                                preview = pdf_data[:200].decode(
-                                    "utf-8",
-                                    errors="replace"
-                                )
-
-                                raise ValueError(
-                                    "Downloaded response is not a valid PDF.\n"
-                                    f"Response starts with: {preview}"
-                                )
-
-                            pdf_path = f"{namef}.pdf"
-
-                            with open(pdf_path, "wb") as file:
-                                file.write(pdf_data)
-
-                            copy = await bot.send_document(
-                                chat_id=channel_id,
-                                document=pdf_path,
-                                caption=cc1
-                            )
-
-                            count += 1
-
-                            if os.path.exists(pdf_path):
-                                os.remove(pdf_path)
-
+                            # Step 4: Mark referer requirement
+                            need_referer = True
                         except Exception as e:
-                            await bot.send_message(
-                                channel_id,
-                                f"⚠️ **PDF Download Failed**\n\n"
-                                f"**Name:** `{name1}`\n\n"
-                                f"<blockquote>{str(e)}</blockquote>",
-                                disable_web_page_preview=True
-                            )
+                            print(f"Error fetching AppxSignURL JSON: {e}")
+                            need_referer = True
+                            namef = name1
+                    
 
-                        # IMPORTANT:
-                        # Do not continue into the yt-dlp PDF code below
-                        continue
-
-                    # -------------------------------------------------
-                    # OTHER PDF SOURCES
-                    # -------------------------------------------------
                     elif "static-db.appx.co.in" in url:
-                        need_referer = True
-                        namef = name1
+                           
+                           need_referer = True
+                           namef = name1
+                    elif "static-db-v2.appx.co.in" in url:
+                           
+                           need_referer = True
+                           namef = name1
 
                     elif "static-db-v2.appx.co.in" in url:
+                        filename = urlparse(url).path.split("/")[-1]
+                        url = f"https://appx-content-v2.classx.co.in/paid_course4/{filename}"
                         need_referer = True
                         namef = name1
-
                     else:
                         if topic == "/yes":
-                            namef = f"{v_name}"
+                            namef = f'{v_name}'
                         else:
                             try:
-                                response = requests.get(
-                                    url,
-                                    timeout=30
-                                )
-
+                                response = requests.get(url)
                                 if response.status_code == 200:
                                     try:
                                         data = response.json()
-                                        namef = data.get(
-                                            "title",
-                                            name1
-                                        ).replace("nn", "")
-                                    except Exception:
+                                        namef = data.get("title", name1).replace("nn", "")
+                                    except:
                                         namef = name1
                                 else:
                                     namef = name1
-
-                            except Exception:
+                            except:
                                 namef = name1
-
                         need_referer = True
-
-                    # -------------------------------------------------
-                    # CW MEDIA PDF
-                    # -------------------------------------------------
                     if "cwmediabkt99" in url:
                         namef = name1
-
-                        max_retries = 15
-                        retry_delay = 4
-                        success = False
-
+                        max_retries = 15  # Define the maximum number of retries
+                        retry_delay = 4  # Delay between retries in seconds
+                        success = False  # To track whether the download was successful
+                        failure_msgs = []  # To keep track of failure messages
+                        
                         for attempt in range(max_retries):
                             try:
                                 await asyncio.sleep(retry_delay)
-
                                 url = url.replace(" ", "%20")
-
                                 scraper = cloudscraper.create_scraper()
                                 response = scraper.get(url)
 
                                 if response.status_code == 200:
-
-                                    pdf_data = response.content
-
-                                    if not pdf_data.startswith(b"%PDF-"):
-                                        raise ValueError(
-                                            "Server response is not a valid PDF"
-                                        )
-
-                                    pdf_path = f"{namef}.pdf"
-
-                                    with open(pdf_path, "wb") as file:
-                                        file.write(pdf_data)
-
-                                    await asyncio.sleep(retry_delay)
-
-                                    copy = await bot.send_document(
-                                        chat_id=channel_id,
-                                        document=pdf_path,
-                                        caption=cc1
-                                    )
-
+                                    with open(f'{namef}.pdf', 'wb') as file:
+                                        file.write(response.content)
+                                    await asyncio.sleep(retry_delay)  # Optional, to prevent spamming
+                                    copy = await bot.send_document(chat_id=channel_id, document=f'{namef}.pdf', caption=cc1)
                                     count += 1
-
-                                    if os.path.exists(pdf_path):
-                                        os.remove(pdf_path)
-
+                                    os.remove(f'{namef}.pdf')
                                     success = True
-                                    break
-
+                                    break  # Exit the retry loop if successful
                                 else:
-                                    failure_msg = await m.reply_text(
-                                        f"Attempt {attempt + 1}/"
-                                        f"{max_retries} failed: "
-                                        f"{response.status_code} "
-                                        f"{response.reason}"
-                                    )
-
-                                    await asyncio.sleep(retry_delay)
-
+                                    failure_msg = await m.reply_text(f"Attempt {attempt + 1}/{max_retries} failed: {response.status_code} {response.reason}")
+                                    failure_msgs.append(failure_msg)
+                                    
                             except Exception as e:
-                                failure_msg = await m.reply_text(
-                                    f"Attempt {attempt + 1}/"
-                                    f"{max_retries} failed: {str(e)}"
-                                )
-
+                                failure_msg = await m.reply_text(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                                failure_msgs.append(failure_msg)
                                 await asyncio.sleep(retry_delay)
-
-                    # -------------------------------------------------
-                    # NORMAL PDF URL
-                    # -------------------------------------------------
+                                continue 
                     else:
                         namef = name1
-
                         try:
+                            # -----------------------------------------
                             if need_referer:
-                                referer = (
-                                    "https://player.akamai.net.in/"
-                                )
-
-                                cmd = (
-                                    f'yt-dlp '
-                                    f'--add-header '
-                                    f'"Referer: {referer}" '
-                                    f'-o "{namef}.pdf" '
-                                    f'"{url}"'
-                                )
+                                referer = "https://player.akamai.net.in/"
+                                cmd = f'yt-dlp --add-header "Referer: {referer}" -o "{namef}.pdf" "{url}"'
                             else:
-                                cmd = (
-                                    f'yt-dlp '
-                                    f'-o "{namef}.pdf" '
-                                    f'"{url}"'
-                                )
+                                cmd = f'yt-dlp -o "{namef}.pdf" "{url}"'
 
-                            download_cmd = (
-                                f"{cmd} "
-                                f"-R 25 "
-                                f"--fragment-retries 25"
-                            )
+                            download_cmd = f"{cmd} -R 25 --fragment-retries 25"
 
+                            # -----------------------------------------
+                            # DOWNLOAD PDF
+                            # -----------------------------------------
                             os.system(download_cmd)
 
-                            pdf_path = f"{namef}.pdf"
-
-                            if not os.path.exists(pdf_path):
-                                raise FileNotFoundError(
-                                    "PDF download failed: "
-                                    "file was not created"
-                                )
-
-                            # Verify the generated file
-                            with open(pdf_path, "rb") as file:
-                                header = file.read(5)
-
-                            if header != b"%PDF-":
-                                os.remove(pdf_path)
-
-                                raise ValueError(
-                                    "Downloaded file is not a valid PDF"
-                                )
-
+                            # -----------------------------------------
+                            # SEND PDF
+                            # -----------------------------------------
                             copy = await bot.send_document(
                                 chat_id=channel_id,
-                                document=pdf_path,
+                                document=f"{namef}.pdf",
                                 caption=cc1
                             )
 
                             count += 1
-
-                            if os.path.exists(pdf_path):
-                                os.remove(pdf_path)
+                            os.remove(f"{namef}.pdf")
 
                         except FloodWait as e:
                             await m.reply_text(str(e))
