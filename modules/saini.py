@@ -522,6 +522,33 @@ async def download_video(url, cmd, name):
     global failed_counter
 
     try:
+        # AppX static-trans video links are often signed ZIP archives.
+        # The .zip is before the query string, so use the URL path rather
+        # than url.endswith(".zip").
+        url_path = urlparse(url).path.lower()
+
+        if url_path.endswith(".zip") and "static-trans" in url_path:
+            print(
+                f"📦 Signed AppX ZIP video detected → "
+                f"downloading/extracting {name}"
+            )
+
+            result = download_drago_mkv(url, name, "zip")
+
+            if (
+                result
+                and os.path.isfile(result)
+                and os.path.getsize(result) > 0
+            ):
+                print(
+                    f"✅ ZIP video ready: {result} "
+                    f"({os.path.getsize(result)} bytes)"
+                )
+                return result
+
+            print("❌ AppX ZIP download/extraction produced no video.")
+            return None
+
         # Transcoded links are direct HLS/M3U8 links in this project.
         if "transcoded" in url.lower():
             print(
@@ -771,11 +798,17 @@ def download_raw_file(url: str, filename: str) -> str | None:
                         f.write(chunk)
                         bar.update(len(chunk))
 
-        return file_path
+        if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+            return file_path
+
+        print("❌ Download completed but output file is empty.")
+        return None
 
     except Exception as e:
         print(f"⚠️ Download interrupted (resume enabled): {e}")
-        return file_path if os.path.exists(file_path) else None
+        if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+            return file_path
+        return None
 # ==============================
 # DOWNLOAD + DECRYPT WRAPPER
 # ==============================
