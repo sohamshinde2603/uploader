@@ -455,44 +455,165 @@ import asyncio
 import subprocess
 import logging
 
+
 async def download_video(url, cmd, name):
-    if "transcoded" in url.lower():
-        print(f"⚡ Transcoded URL detected → using download_m3u8 for {name}")
-        return download_m3u8(url, name)
-    
-    download_cmd = f'{cmd} -R 25 --fragment-retries 25 --external-downloader aria2c --downloader-args "aria2c: -x 16 -j 32"'
-    global failed_counter
-    print(download_cmd)
-    logging.info(download_cmd)
+    """
+    Download a video without requiring the external aria2c binary.
 
-    k = subprocess.run(download_cmd, shell=True)
-
-    if "visionias" in cmd and k.returncode != 0 and failed_counter <= 10:
-        failed_counter += 1
-        await asyncio.sleep(5)
-        return await download_video(url, cmd, name)
-
-    failed_counter = 0
-
+    The previous implementation forced:
+        --external-downloader aria2c
+    but Render's Python environment does not necessarily have the
+    aria2c executable installed. That makes yt-dlp fail before creating
+    the output file.
+    """
     try:
-        if os.path.isfile(name):
-            return name
-        elif os.path.isfile(f"{name}.webm"):
-            return f"{name}.webm"
+        if "transcoded" in url.lower():
+            print(
+                f"⚡ Transcoded URL detected → using download_m3u8 for {name}"
+            )
+            result = download_m3u8(url, name)
 
-        base = name.split(".")[0]
+            if (
+                result
+                and os.path.isfile(result)
+                and os.path.getsize(result) > 0
+            ):
+                return result
 
-        if os.path.isfile(f"{base}.mkv"):
-            return f"{base}.mkv"
-        elif os.path.isfile(f"{base}.mp4"):
-            return f"{base}.mp4"
-        elif os.path.isfile(f"{base}.mp4.webm"):
-            return f"{base}.mp4.webm"
+            print("❌ M3U8 download did not produce a valid file.")
+            return None
 
-        return name
+        global failed_counter
 
-    except FileNotFoundError:
-        return os.path.splitext(name)[0] + ".mp4"
+        # IMPORTANT:
+        # Do NOT force aria2c here. It is a separate system executable,
+        # not the Python "wget/ffmpeg" packages installed by requirements.
+        #
+        # Keep the caller's original yt-dlp command intact and only add
+        # yt-dlp's own retry options.
+        download_cmd = (
+            f'{cmd} '
+            f'--retries 25 '
+            f'--fragment-retries 25 '
+            f'--file-access-retries 25 '
+            f'--no-mtime'
+        )
+
+        print("[VIDEO DOWNLOAD COMMAND]")
+        print(download_cmd)
+        logging.info(download_cmd)
+
+        process = await asyncio.create_subprocess_shell(
+            download_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await process.communicate()
+
+        stdout_text = stdout.decode(errors="ignore")
+        stderr_text = stderr.decode(errors="ignore")
+
+        print("[YT-DLP STDOUT]")
+        print(stdout_text)
+
+        if process.returncode != 0:
+            print("[YT-DLP STDERR]")
+            print(stderr_text)
+
+            if "visionias" in cmd and failed_counter <= 10:
+                failed_counter += 1
+                await asyncio.sleep(5)
+                return await download_video(url, cmd, name)
+
+            failed_counter = 0
+            return None
+
+        failed_counter = 0
+
+        # First: check the exact requested output.
+        possible_files = [
+            name,
+            f"{name}.mp4",
+            f"{name}.mkv",
+            f"{name}.webm",
+            f"{name}.mp4.webm",
+        ]
+
+        base = os.path.splitext(name)[0]
+        possible_files.extend([
+            f"{base}.mp4",
+            f"{base}.mkv",
+            f"{base}.webm",
+            f"{base}.mp4.webm",
+        ])
+
+        for file_path in possible_files:
+            if (
+                os.path.isfile(file_path)
+                and os.path.getsize(file_path) > 0
+            ):
+                print(
+                    f"✅ Video downloaded: {file_path} "
+                    f"({os.path.getsize(file_path)} bytes)"
+                )
+                return file_path
+
+        # yt-dlp may have selected a different extension/container.
+        # Parse its output for an actual existing path.
+        output_lines = (
+            stdout_text.splitlines() +
+            stderr_text.splitlines()
+        )
+
+        for line in reversed(output_lines):
+            candidate = line.strip().strip('"').strip("'")
+
+            if (
+                os.path.isfile(candidate)
+                and os.path.getsize(candidate) > 0
+            ):
+                print(
+                    f"✅ Video downloaded from yt-dlp output: "
+                    f"{candidate}"
+                )
+                return candidate
+
+        # Last resort: look for recently-created media files matching
+        # the requested basename in the current working directory.
+        prefix = os.path.basename(base)
+        matches = []
+
+        for entry in os.listdir("."):
+            if not entry.startswith(prefix):
+                continue
+
+            if not entry.lower().endswith(
+                (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+            ):
+                continue
+
+            if os.path.isfile(entry) and os.path.getsize(entry) > 0:
+                matches.append(entry)
+
+        if matches:
+            matches.sort(
+                key=lambda p: os.path.getmtime(p),
+                reverse=True
+            )
+            print(f"✅ Found downloaded media: {matches[0]}")
+            return matches[0]
+
+        print(
+            "❌ yt-dlp exited successfully but no video file was found."
+        )
+        print(f"[VIDEO] Expected name: {name}")
+        return None
+
+    except Exception as e:
+        print(f"❌ Video download exception: {e}")
+        logging.exception("Video download exception")
+        return None
 import os
 import os
 import time
