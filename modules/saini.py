@@ -457,6 +457,12 @@ import logging
 
 
 async def download_video(url, cmd, name):
+    print("========== DOWNLOAD_VIDEO CALLED ==========")
+    print(f"[VIDEO] URL: {url}")
+    print(f"[VIDEO] Name: {name}")
+    print(f"[VIDEO] CMD: {cmd}")
+    print("===========================================")
+
     """
     Reliable video downloader.
 
@@ -832,14 +838,75 @@ async def send_vid(
     w_filename = filename
 
     try:
-        # Check that download_video() really produced a file.
+        # Check that the downloader produced a file.
+        # Some download paths return a relative/old filename while the
+        # actual file is written inside ./downloads, so try that directory
+        # before declaring the download failed.
         if not filename or not os.path.isfile(filename):
-            await m.reply_text(
-                "❌ **Video download failed.**\n\n"
-                "The downloader did not create a video file."
-            )
-            print(f"[VIDEO] Missing downloaded file: {filename}")
-            return
+            print("========== VIDEO DEBUG ==========")
+            print(f"[VIDEO] Returned filename: {filename!r}")
+            print(f"[VIDEO] Current directory: {os.getcwd()}")
+
+            candidates = []
+
+            for folder in (".", "downloads", "/tmp"):
+                if os.path.isdir(folder):
+                    try:
+                        for entry in os.scandir(folder):
+                            if not entry.is_file():
+                                continue
+
+                            lower = entry.name.lower()
+                            if lower.endswith(
+                                (".mp4", ".mkv", ".webm", ".mov", ".ts")
+                            ):
+                                candidates.append(
+                                    (
+                                        entry.stat().st_mtime,
+                                        entry.path,
+                                        entry.stat().st_size,
+                                    )
+                                )
+                    except Exception as scan_error:
+                        print(
+                            f"[VIDEO] Directory scan failed for "
+                            f"{folder}: {scan_error}"
+                        )
+
+            candidates.sort(reverse=True)
+
+            fallback = None
+            for mtime, path, size in candidates:
+                if size > 0:
+                    fallback = path
+                    break
+
+            if fallback:
+                print(
+                    f"[VIDEO] Using fallback video file: {fallback} "
+                    f"({os.path.getsize(fallback)} bytes)"
+                )
+                filename = fallback
+                thumb_path = f"{filename}.jpg"
+                w_filename = filename
+            else:
+                print("[VIDEO] No video file was found.")
+                print("[VIDEO] Top-level files:", os.listdir("."))
+                if os.path.isdir("downloads"):
+                    print(
+                        "[VIDEO] downloads files:",
+                        os.listdir("downloads")
+                    )
+                print("================================")
+
+                await m.reply_text(
+                    "❌ **Video download failed.**\n\n"
+                    f"Returned filename: `{filename}`\n"
+                    "No video file was created."
+                )
+                return
+
+            print("================================")
 
         if os.path.getsize(filename) <= 0:
             await m.reply_text("❌ Downloaded video is empty.")
