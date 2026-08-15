@@ -11,8 +11,6 @@ import logging
 # Retry counter used by download_video()
 failed_counter = 0
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import tgcrypto
 import subprocess
 import concurrent.futures
@@ -25,6 +23,7 @@ from pathlib import Path
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from base64 import b64decode
+from urllib.parse import urlparse
 
 def duration(filename):
     if not Path(filename).exists():
@@ -604,205 +603,163 @@ import subprocess
 import logging
 
 async def download_video(url, cmd, name):
-    """Download a video and return the real file path.
+    """Run the existing video downloader and return only a real file path.
 
-    Transcoded AppX M3U8 URLs use the local async M3U8 downloader.
-    All other URLs use yt-dlp. No aria2c dependency is required.
+    This wrapper does not alter or bypass any DRM/license mechanism.
+    It only validates downloader output and reports useful failures.
     """
     global failed_counter
 
     try:
-        # AppX static-trans video links are often signed ZIP archives.
-        # The .zip is before the query string, so use the URL path rather
-        # than url.endswith(".zip").
+        print(f"🎬 Starting video download: {name}")
+        print(f"🔗 URL type: {urlparse(url).path.rsplit('/', 1)[-1]}")
+
+        # Preserve the existing ZIP/M3U8/yt-dlp routing.
         url_path = urlparse(url).path.lower()
 
         if url_path.endswith(".zip") and "static-trans" in url_path:
-            print(
-                f"📦 Signed AppX ZIP video detected → "
-                f"downloading/extracting {name}"
-            )
-
+            print("📦 Signed ZIP video detected.")
             result = download_drago_mkv(url, name, "zip")
 
-            if (
-                result
-                and os.path.isfile(result)
-                and os.path.getsize(result) > 0
-            ):
-                print(
-                    f"✅ ZIP video ready: {result} "
-                    f"({os.path.getsize(result)} bytes)"
-                )
-                return result
-
-            print(
-                "❌ AppX ZIP route returned no usable video. "
-                "See signed-video/FFmpeg logs above."
-            )
-            return None
-
-        # Transcoded links are direct HLS/M3U8 links in this project.
-        if "transcoded" in url.lower():
-            print(
-                f"⚡ Transcoded URL detected → "
-                f"using download_m3u8_async for {name}"
-            )
-
+        elif "transcoded" in url.lower():
+            print("⚡ Transcoded/HLS URL detected.")
             result = await download_m3u8_async(url, name)
 
-            if (
-                result
-                and os.path.isfile(result)
-                and os.path.getsize(result) > 0
-            ):
-                print(
-                    f"✅ M3U8 video ready: {result} "
-                    f"({os.path.getsize(result)} bytes)"
-                )
-                return result
+        else:
+            download_cmd = re.sub(
+                r'\s+--external-downloader(?:=|\s+)aria2c',
+                '',
+                cmd,
+                flags=re.IGNORECASE,
+            )
+            download_cmd = re.sub(
+                r'\s+--downloader-args(?:=|\s+)"aria2c:[^"]*"',
+                '',
+                download_cmd,
+                flags=re.IGNORECASE,
+            )
+            download_cmd = re.sub(
+                r"\s+--downloader-args(?:=|\s+)'aria2c:[^']*'",
+                '',
+                download_cmd,
+                flags=re.IGNORECASE,
+            )
 
-            print("❌ M3U8 download did not produce a valid file.")
+            download_cmd = (
+                f'{download_cmd} '
+                f'--retries 25 '
+                f'--fragment-retries 25 '
+                f'--file-access-retries 25 '
+                f'--no-mtime '
+                f'--no-part '
+                f'--print after_move:filepath'
+            )
+
+            print("[VIDEO DOWNLOAD COMMAND]")
+            print(download_cmd)
+
+            process = await asyncio.create_subprocess_shell(
+                download_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+
+            stdout_text = stdout.decode(errors="ignore")
+            stderr_text = stderr.decode(errors="ignore")
+
+            print("[YT-DLP STDOUT]")
+            print(stdout_text)
+            if stderr_text:
+                print("[YT-DLP STDERR]")
+                print(stderr_text)
+
+            if process.returncode != 0:
+                failed_counter = 0
+                return None
+
+            candidates = []
+
+            for line in reversed(
+                (stdout_text + "\n" + stderr_text).splitlines()
+            ):
+                candidate = line.strip().strip('"').strip("'")
+                if (
+                    candidate
+                    and os.path.isfile(candidate)
+                    and os.path.getsize(candidate) > 0
+                ):
+                    candidates.append(candidate)
+
+            base = os.path.splitext(name)[0]
+            candidates.extend([
+                name,
+                f"{name}.webm",
+                f"{name}.mp4",
+                f"{name}.mkv",
+                f"{name}.mp4.webm",
+                f"{base}.mp4",
+                f"{base}.mkv",
+                f"{base}.webm",
+                f"{base}.mp4.webm",
+            ])
+
+            for root in (".", "downloads"):
+                if os.path.isdir(root):
+                    for dirpath, _, filenames in os.walk(root):
+                        for filename in filenames:
+                            if filename.lower().endswith(
+                                (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+                            ):
+                                candidates.append(
+                                    os.path.join(dirpath, filename)
+                                )
+
+            result = None
+            seen = set()
+
+            for candidate in candidates:
+                if not isinstance(candidate, (str, bytes, os.PathLike)):
+                    continue
+
+                candidate = os.path.normpath(candidate)
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+
+                if (
+                    os.path.isfile(candidate)
+                    and os.path.getsize(candidate) > 0
+                ):
+                    result = candidate
+                    break
+
+        # CRITICAL: validate before returning. os.path.isfile() requires
+        # a real path-like value; never pass None downstream.
+        if not isinstance(result, (str, bytes, os.PathLike)):
+            print(
+                "❌ Downloader returned no path. "
+                "The underlying download/decryption step failed."
+            )
             return None
 
-        # Remove legacy aria2c options if an older caller still supplies them.
-        download_cmd = re.sub(
-            r'\s+--external-downloader(?:=|\s+)aria2c',
-            '',
-            cmd,
-            flags=re.IGNORECASE
-        )
-        download_cmd = re.sub(
-            r'\s+--downloader-args(?:=|\s+)"aria2c:[^"]*"',
-            '',
-            download_cmd,
-            flags=re.IGNORECASE
-        )
-        download_cmd = re.sub(
-            r"\s+--downloader-args(?:=|\s+)'aria2c:[^']*'",
-            '',
-            download_cmd,
-            flags=re.IGNORECASE
-        )
+        if not os.path.isfile(result):
+            print(f"❌ Downloader returned missing file: {result!r}")
+            return None
 
-        download_cmd = (
-            f'{download_cmd} '
-            f'--retries 25 '
-            f'--fragment-retries 25 '
-            f'--file-access-retries 25 '
-            f'--no-mtime '
-            f'--no-part '
-            f'--print after_move:filepath'
-        )
-
-        print("[VIDEO DOWNLOAD COMMAND]")
-        print(download_cmd)
-        logging.info(download_cmd)
-
-        process = await asyncio.create_subprocess_shell(
-            download_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        stdout, stderr = await process.communicate()
-
-        stdout_text = stdout.decode(errors="ignore")
-        stderr_text = stderr.decode(errors="ignore")
-
-        print("[YT-DLP STDOUT]")
-        print(stdout_text)
-
-        if stderr_text:
-            print("[YT-DLP STDERR]")
-            print(stderr_text)
-
-        if process.returncode != 0:
-            if "visionias" in cmd.lower() and failed_counter < 10:
-                failed_counter += 1
-                await asyncio.sleep(5)
-                return await download_video(url, cmd, name)
-
-            failed_counter = 0
+        if os.path.getsize(result) <= 0:
+            print(f"❌ Downloader returned an empty file: {result!r}")
             return None
 
         failed_counter = 0
-
-        # Prefer paths printed by yt-dlp.
-        candidates = []
-        for line in reversed(
-            (stdout_text + "\n" + stderr_text).splitlines()
-        ):
-            candidate = line.strip().strip('"').strip("'")
-            if (
-                candidate
-                and os.path.isfile(candidate)
-                and os.path.getsize(candidate) > 0
-            ):
-                candidates.append(candidate)
-
-        # Common names used by this bot.
-        base = os.path.splitext(name)[0]
-        candidates.extend([
-            name,
-            f"{name}.webm",
-            f"{name}.mp4",
-            f"{name}.mkv",
-            f"{name}.mp4.webm",
-            f"{base}.mp4",
-            f"{base}.mkv",
-            f"{base}.webm",
-            f"{base}.mp4.webm",
-        ])
-
-        # Search downloads/ as a fallback.
-        for root in (".", "downloads"):
-            if not os.path.isdir(root):
-                continue
-
-            for dirpath, _, filenames in os.walk(root):
-                for filename in filenames:
-                    if filename.lower().endswith(
-                        (".mp4", ".mkv", ".webm", ".mov", ".m4v")
-                    ):
-                        candidates.append(
-                            os.path.join(dirpath, filename)
-                        )
-
-        seen = set()
-        valid = []
-
-        for candidate in candidates:
-            candidate = os.path.normpath(candidate)
-
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-
-            if (
-                os.path.isfile(candidate)
-                and os.path.getsize(candidate) > 0
-            ):
-                valid.append(candidate)
-
-        if valid:
-            valid.sort(
-                key=lambda path: os.path.getmtime(path),
-                reverse=True
-            )
-            result = valid[0]
-            print(
-                f"✅ Video downloaded: {result} "
-                f"({os.path.getsize(result)} bytes)"
-            )
-            return result
-
-        print("❌ yt-dlp finished but no video file was found.")
-        print(f"[VIDEO] Expected name: {name}")
-        return None
+        print(
+            f"✅ Valid video file: {result} "
+            f"({os.path.getsize(result)} bytes)"
+        )
+        return result
 
     except Exception as e:
-        print(f"❌ Video download exception: {e}")
+        print(f"❌ Video download exception: {type(e).__name__}: {e}")
         logging.exception("Video download exception")
         return None
 
@@ -977,9 +934,25 @@ async def send_vid(
     prog,
     channel_id
 ):
-    if not filename or not os.path.isfile(filename) or os.path.getsize(filename) == 0:
-        print(f"❌ Video file missing or empty: {filename}")
-        await m.reply_text("❌ Video download failed. No video file was created.")
+    # ==========================
+    # INPUT FILE SAFETY CHECK
+    # ==========================
+    if not isinstance(filename, (str, bytes, os.PathLike)):
+        await m.reply_text(
+            "❌ Video download failed. No valid output file was created."
+        )
+        return
+
+    if not os.path.isfile(filename):
+        await m.reply_text(
+            f"❌ Video file not found: `{filename}`"
+        )
+        return
+
+    if os.path.getsize(filename) <= 0:
+        await m.reply_text(
+            "❌ Video file is empty."
+        )
         return
 
     # ==========================
@@ -990,11 +963,7 @@ async def send_vid(
         f'ffmpeg -y -i "{filename}" -ss 00:00:10 -vframes 1 "{thumb_path}"'
     )
 
-    try:
-        # drm_handler may already have deleted this message.
-        await prog.delete(True)
-    except Exception:
-        pass
+    await prog.delete(True)
 
     reply1 = await bot.send_message(
         channel_id,
@@ -1065,12 +1034,10 @@ async def send_vid(
     # ==========================
     # CLEANUP
     # ==========================
-    if os.path.isfile(w_filename):
-        os.remove(w_filename)
-    try:
-        await reply.delete(True)
-        await reply1.delete(True)
+    
     except Exception:
-        pass
-    if os.path.isfile(thumb_path):
-        os.remove(thumb_path)
+        await bot.send_document(channel_id, w_filename, caption=cc, progress=progress_bar, progress_args=(reply, start_time))
+    os.remove(w_filename)
+    await reply.delete(True)
+    await reply1.delete(True)
+    os.remove(f"{filename}.jpg")
