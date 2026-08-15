@@ -458,39 +458,101 @@ import logging
 
 async def download_video(url, cmd, name):
     """
-    Download a video without requiring the external aria2c binary.
+    Reliable video downloader.
 
-    The previous implementation forced:
-        --external-downloader aria2c
-    but Render's Python environment does not necessarily have the
-    aria2c executable installed. That makes yt-dlp fail before creating
-    the output file.
+    M3U8/HLS URLs are handled by FFmpeg directly so HLS segments are
+    processed in the correct order. Other URLs continue through yt-dlp.
+    No aria2c dependency is required.
     """
     try:
-        if "transcoded" in url.lower():
-            print(
-                f"⚡ Transcoded URL detected → using download_m3u8 for {name}"
+        os.makedirs("downloads", exist_ok=True)
+
+        base_name = os.path.splitext(os.path.basename(name))[0]
+        output_path = os.path.abspath(
+            os.path.join("downloads", f"{base_name}.mp4")
+        )
+
+        # -------------------------------------------------
+        # M3U8 / HLS
+        # -------------------------------------------------
+        if ".m3u8" in url.lower():
+            print(f"[VIDEO] M3U8 detected: {url}")
+            print(f"[VIDEO] Output: {output_path}")
+
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+
+            headers = (
+                "User-Agent: Mozilla/5.0\r\n"
+                "Referer: https://player.akamai.net.in/\r\n"
+                "Origin: https://player.akamai.net.in\r\n"
+                "Accept: */*\r\n"
             )
-            result = download_m3u8(url, name)
+
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "warning",
+                "-headers", headers,
+                "-i", url,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                output_path,
+            ]
+
+            print("[VIDEO] Running FFmpeg for HLS/M3U8")
+
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await process.communicate()
+
+            stdout_text = stdout.decode(errors="ignore")
+            stderr_text = stderr.decode(errors="ignore")
+
+            if stdout_text:
+                print("[FFMPEG STDOUT]")
+                print(stdout_text)
+
+            if stderr_text:
+                print("[FFMPEG STDERR]")
+                print(stderr_text)
 
             if (
-                result
-                and os.path.isfile(result)
-                and os.path.getsize(result) > 0
+                process.returncode == 0
+                and os.path.isfile(output_path)
+                and os.path.getsize(output_path) > 0
             ):
-                return result
+                print(
+                    f"OK M3U8 video downloaded: {output_path} "
+                    f"({os.path.getsize(output_path)} bytes)"
+                )
+                return output_path
 
-            print("❌ M3U8 download did not produce a valid file.")
+            print(
+                f"FFmpeg failed for M3U8. "
+                f"returncode={process.returncode}"
+            )
+
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+
             return None
 
+        # -------------------------------------------------
+        # NORMAL YT-DLP DOWNLOAD
+        # -------------------------------------------------
         global failed_counter
 
-        # IMPORTANT:
-        # Do NOT force aria2c here. It is a separate system executable,
-        # not the Python "wget/ffmpeg" packages installed by requirements.
-        #
-        # Keep the caller's original yt-dlp command intact and only add
-        # yt-dlp's own retry options.
         download_cmd = (
             f'{cmd} '
             f'--retries 25 '
@@ -501,12 +563,11 @@ async def download_video(url, cmd, name):
 
         print("[VIDEO DOWNLOAD COMMAND]")
         print(download_cmd)
-        logging.info(download_cmd)
 
         process = await asyncio.create_subprocess_shell(
             download_cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
         )
 
         stdout, stderr = await process.communicate()
@@ -531,7 +592,6 @@ async def download_video(url, cmd, name):
 
         failed_counter = 0
 
-        # First: check the exact requested output.
         possible_files = [
             name,
             f"{name}.mp4",
@@ -541,6 +601,7 @@ async def download_video(url, cmd, name):
         ]
 
         base = os.path.splitext(name)[0]
+
         possible_files.extend([
             f"{base}.mp4",
             f"{base}.mkv",
@@ -554,66 +615,23 @@ async def download_video(url, cmd, name):
                 and os.path.getsize(file_path) > 0
             ):
                 print(
-                    f"✅ Video downloaded: {file_path} "
+                    f"OK Video downloaded: {file_path} "
                     f"({os.path.getsize(file_path)} bytes)"
                 )
                 return file_path
 
-        # yt-dlp may have selected a different extension/container.
-        # Parse its output for an actual existing path.
-        output_lines = (
-            stdout_text.splitlines() +
-            stderr_text.splitlines()
-        )
-
-        for line in reversed(output_lines):
-            candidate = line.strip().strip('"').strip("'")
-
-            if (
-                os.path.isfile(candidate)
-                and os.path.getsize(candidate) > 0
-            ):
-                print(
-                    f"✅ Video downloaded from yt-dlp output: "
-                    f"{candidate}"
-                )
-                return candidate
-
-        # Last resort: look for recently-created media files matching
-        # the requested basename in the current working directory.
-        prefix = os.path.basename(base)
-        matches = []
-
-        for entry in os.listdir("."):
-            if not entry.startswith(prefix):
-                continue
-
-            if not entry.lower().endswith(
-                (".mp4", ".mkv", ".webm", ".mov", ".m4v")
-            ):
-                continue
-
-            if os.path.isfile(entry) and os.path.getsize(entry) > 0:
-                matches.append(entry)
-
-        if matches:
-            matches.sort(
-                key=lambda p: os.path.getmtime(p),
-                reverse=True
-            )
-            print(f"✅ Found downloaded media: {matches[0]}")
-            return matches[0]
-
-        print(
-            "❌ yt-dlp exited successfully but no video file was found."
-        )
+        print("yt-dlp completed but no output video was found.")
         print(f"[VIDEO] Expected name: {name}")
+        print("[YT-DLP STDERR]")
+        print(stderr_text)
+
         return None
 
     except Exception as e:
-        print(f"❌ Video download exception: {e}")
+        print(f"Video download exception: {e}")
         logging.exception("Video download exception")
         return None
+
 import os
 import os
 import time
