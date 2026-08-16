@@ -7,6 +7,9 @@ import aiohttp
 import aiofiles
 import asyncio
 import logging
+
+# Retry counter used by download_video()
+failed_counter = 0
 import requests
 import tgcrypto
 import subprocess
@@ -367,22 +370,162 @@ def download_drago_mkv(url: str, filename: str, ext: str) -> str | None:
         print(f"⚠️ Download interrupted (resume enabled): {e}")
         return file_path if os.path.exists(file_path) else None
 
-def download_drago_mkv(url: str, name: str) -> str | None:
+def download_drago_mkv(url: str, name: str, ext: str = None) -> str | None:
+    """Download signed AppX video ZIPs and turn their TS segments into MP4."""
+    try:
+        parsed = urlparse(url)
+        path_ext = os.path.splitext(parsed.path)[1].lower()
+        actual_ext = (ext or path_ext.lstrip(".") or "mkv").lower()
 
-    # 🔹 resolve redirect
-    r = requests.get(url, allow_redirects=True, timeout=15)
-    final_url = r.url
+        os.makedirs("downloads", exist_ok=True)
 
-    # 🔹 ZIP case
-    if final_url.endswith(".zip"):
-        zip_path = download_raw_file(final_url, name, "zip")
-        folder = extract_zip(zip_path)
-        return merge_ts_files(folder, f"downloads/{name}.mp4")
+        # Signed static-trans URLs are ZIP archives. Download them directly
+        # to a real .zip file; do not use the legacy .mkv raw downloader.
+        if actual_ext == "zip" or path_ext == ".zip":
+            zip_path = os.path.join("downloads", f"{name}.zip")
+            extract_dir = os.path.join("downloads", f"{name}_extract")
+            output_path = os.path.join("downloads", f"{name}.mp4")
 
-    # 🔹 MKV (encrypted) case
-    else:
-        return download_raw_file(final_url, name, "mkv")
-    
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13)",
+                "Referer": "https://akstechnicalclasses.classx.co.in/",
+                "Origin": "https://akstechnicalclasses.classx.co.in",
+                "Accept": "*/*",
+                "Connection": "keep-alive",
+            }
+
+            print(f"📦 Downloading signed ZIP: {url}")
+
+            # Always start clean. A previous partial ZIP must never be
+            # appended to a new signed URL.
+            for old in (zip_path, output_path):
+                try:
+                    if os.path.isfile(old):
+                        os.remove(old)
+                except OSError:
+                    pass
+
+            response = requests.get(
+                url,
+                headers=headers,
+                stream=True,
+                timeout=(20, 300),
+                allow_redirects=True,
+            )
+            print(f"📦 ZIP HTTP status: {response.status_code}")
+            response.raise_for_status()
+
+            total = 0
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        total += len(chunk)
+
+            response.close()
+
+            print(f"📦 ZIP downloaded: {total} bytes")
+
+            if total == 0 or not os.path.isfile(zip_path):
+                print("❌ Signed ZIP response was empty.")
+                return None
+
+            # A ZIP starts with PK. ZipFile gives a stronger validation.
+            if not zipfile.is_zipfile(zip_path):
+                with open(zip_path, "rb") as f:
+                    prefix = f.read(64)
+                print(
+                    "❌ Response is not a valid ZIP. "
+                    f"Content-Type={response.headers.get('Content-Type')}; "
+                    f"starts={prefix!r}"
+                )
+                return None
+
+            # Remove an old extraction directory.
+            if os.path.isdir(extract_dir):
+                shutil.rmtree(extract_dir)
+
+            os.makedirs(extract_dir, exist_ok=True)
+
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(extract_dir)
+
+            # Find TS/TSE files recursively. Some AppX archives contain
+            # subdirectories rather than placing the segments at the root.
+            ts_files = []
+            for root, _, files in os.walk(extract_dir):
+                for filename in files:
+                    if filename.lower().endswith((".ts", ".tse")):
+                        ts_files.append(os.path.join(root, filename))
+
+            if not ts_files:
+                print("❌ ZIP contains no .ts/.tse video segments.")
+                return None
+
+            # Sort naturally by numeric parts where possible.
+            def segment_key(path):
+                base = os.path.basename(path)
+                parts = re.split(r"(\d+)", base)
+                return [
+                    int(x) if x.isdigit() else x.lower()
+                    for x in parts
+                ]
+
+            ts_files.sort(key=segment_key)
+
+            list_file = os.path.join(extract_dir, "list.txt")
+            with open(list_file, "w", encoding="utf-8") as f:
+                for segment in ts_files:
+                    # concat demuxer requires escaped single quotes.
+                    safe = os.path.abspath(segment).replace("'", r"'\''")
+                    f.write(f"file '{safe}'\n")
+
+            print(f"🎬 Merging {len(ts_files)} video segments...")
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    list_file,
+                    "-c",
+                    "copy",
+                    output_path,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            if (
+                os.path.isfile(output_path)
+                and os.path.getsize(output_path) > 0
+            ):
+                print(
+                    f"✅ Final MP4: {output_path} "
+                    f"({os.path.getsize(output_path)} bytes)"
+                )
+                return output_path
+
+            print("❌ FFmpeg did not create a valid MP4.")
+            return None
+
+        # Non-ZIP fallback.
+        return download_raw_file(url, name)
+
+    except subprocess.CalledProcessError as e:
+        print(f"❌ FFmpeg merge failed: {e.stderr[-4000:] if e.stderr else e}")
+        return None
+    except Exception as e:
+        print(f"❌ Signed video download failed: {type(e).__name__}: {e}")
+        logging.exception("Signed video download failed")
+        return None
+
 def human_readable_size(size, decimal_places=2):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
         if size < 1024.0 or unit == 'PB':
@@ -398,7 +541,7 @@ def time_name():
     return f"{date} {current_time}.mp4"
 
 import os, re, asyncio, aiohttp
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 async def fetch_segment(session, seg_url, headers):
     async with session.get(seg_url, headers=headers, timeout=30) as resp:
@@ -408,7 +551,7 @@ async def fetch_segment(session, seg_url, headers):
 import aiohttp
 import asyncio
 import os
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 async def fetch_segment(session, seg_url, f):
     async with session.get(seg_url) as resp:
@@ -420,24 +563,19 @@ async def fetch_segment(session, seg_url, f):
             f.write(chunk)
 
 async def download_m3u8_async(url: str, filename: str):
-    """Download an accessible, non-DRM HLS/M3U8 stream with FFmpeg."""
+    """Download an accessible HLS/M3U8 stream with FFmpeg.
+    Does not bypass DRM/license protection.
+    """
     os.makedirs("downloads", exist_ok=True)
-
-    safe_name = os.path.basename(str(filename))
-    safe_name = os.path.splitext(safe_name)[0]
-    final_file = os.path.abspath(os.path.join("downloads", safe_name + ".mp4"))
-    temp_file = final_file + ".part"
+    safe_name = os.path.splitext(os.path.basename(str(filename)))[0]
+    output = os.path.abspath(os.path.join("downloads", safe_name + ".mp4"))
+    part = output + ".part"
 
     parsed = urlparse(url)
-    referer = f"{parsed.scheme}://{parsed.netloc}/" if parsed.netloc else ""
-
-    headers = (
-        "User-Agent: Mozilla/5.0\r\n"
-        "Accept: */*\r\n"
-    )
-    if referer:
-        headers += f"Referer: {referer}\r\n"
-        headers += f"Origin: {parsed.scheme}://{parsed.netloc}\r\n"
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+    headers = "User-Agent: Mozilla/5.0\r\nAccept: */*\r\n"
+    if origin:
+        headers += f"Origin: {origin}\r\nReferer: {origin}/\r\n"
 
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
@@ -445,55 +583,45 @@ async def download_m3u8_async(url: str, filename: str):
         "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
         "-allowed_extensions", "ALL",
         "-i", url,
-        "-map", "0:v:0?",
-        "-map", "0:a:0?",
-        "-c", "copy",
-        "-movflags", "+faststart",
-        temp_file,
+        "-map", "0:v:0?", "-map", "0:a:0?",
+        "-c", "copy", "-movflags", "+faststart",
+        part,
     ]
 
-    print(f"🎬 HLS download: {url}", flush=True)
-
+    print(f"🎬 HLS input: {url}", flush=True)
     try:
-        process = await asyncio.create_subprocess_exec(
+        proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
-
-        out = stdout.decode(errors="replace").strip()
-        err = stderr.decode(errors="replace").strip()
+        stdout, stderr = await proc.communicate()
+        out = stdout.decode(errors="replace")
+        err = stderr.decode(errors="replace")
 
         if out:
             print("[FFMPEG STDOUT]\n" + out, flush=True)
         if err:
             print("[FFMPEG STDERR]\n" + err, flush=True)
 
-        if process.returncode != 0:
-            print(f"❌ FFmpeg exited with code {process.returncode}", flush=True)
+        if proc.returncode != 0:
+            print(f"❌ FFmpeg exited with {proc.returncode}", flush=True)
             return None
 
-        if not os.path.isfile(temp_file) or os.path.getsize(temp_file) <= 0:
-            print("❌ FFmpeg created no output file.", flush=True)
+        if not os.path.isfile(part) or os.path.getsize(part) <= 0:
+            print("❌ FFmpeg created no output.", flush=True)
             return None
 
-        os.replace(temp_file, final_file)
-        print(
-            f"✅ HLS output: {final_file} "
-            f"({os.path.getsize(final_file)} bytes)",
-            flush=True,
-        )
-        return final_file
-
-    except Exception as e:
-        print(f"❌ HLS exception: {type(e).__name__}: {e}", flush=True)
-        logging.exception("HLS download exception")
+        os.replace(part, output)
+        print(f"✅ HLS video ready: {output}", flush=True)
+        return output
+    except Exception as exc:
+        print(f"❌ HLS downloader error: {type(exc).__name__}: {exc}", flush=True)
         return None
     finally:
-        if os.path.exists(temp_file):
+        if os.path.exists(part):
             try:
-                os.remove(temp_file)
+                os.remove(part)
             except OSError:
                 pass
 
@@ -506,113 +634,88 @@ import logging
 
 async def download_video(url, cmd, name):
     global failed_counter
-
     try:
-        lower_url = str(url).lower()
+        lower = str(url).lower()
 
-        # ClassPlus HLS route. This is ordinary HLS handling only; it does
-        # not bypass DRM/license protection.
-        if (
-            ".m3u8" in lower_url
-            or "media-cdn.classplusapp.com" in lower_url
-        ):
-            print(f"🎬 ClassPlus HLS detected → {name}", flush=True)
+        # Normal accessible ClassPlus/other HLS route.
+        if ".m3u8" in lower or "media-cdn.classplusapp.com" in lower:
+            print(f"🎬 HLS/ClassPlus URL detected: {name}", flush=True)
             result = await download_m3u8_async(url, name)
-
             if (
                 isinstance(result, (str, bytes, os.PathLike))
                 and os.path.isfile(result)
                 and os.path.getsize(result) > 0
             ):
                 return result
-
-            print("❌ ClassPlus HLS produced no valid file.", flush=True)
+            print("❌ HLS downloader produced no valid file.", flush=True)
             return None
 
-        print(f"▶️ Running downloader for: {name}", flush=True)
-        print(download_cmd := (
-            f'{cmd} -R 25 --fragment-retries 25 '
-            f'--external-downloader aria2c '
-            f'--downloader-args "aria2c: -x 16 -j 32"'
-        ), flush=True)
+        download_cmd = re.sub(
+            r'\s+--external-downloader(?:=|\s+)aria2c', '',
+            cmd, flags=re.IGNORECASE
+        )
+        download_cmd = re.sub(
+            r'\s+--downloader-args(?:=|\s+)"aria2c:[^"]*"',
+            '', download_cmd, flags=re.IGNORECASE
+        )
+        download_cmd = re.sub(
+            r"\s+--downloader-args(?:=|\s+)'aria2c:[^']*'",
+            '', download_cmd, flags=re.IGNORECASE
+        )
+        download_cmd += (
+            ' --retries 25 --fragment-retries 25 '
+            '--file-access-retries 25 --no-mtime --no-part '
+            '--print after_move:filepath'
+        )
 
-        process = await asyncio.create_subprocess_shell(
+        print("[VIDEO DOWNLOAD COMMAND]")
+        print(download_cmd)
+
+        proc = await asyncio.create_subprocess_shell(
             download_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
-
+        stdout, stderr = await proc.communicate()
         out = stdout.decode(errors="replace")
         err = stderr.decode(errors="replace")
-
-        if out:
-            print("[DOWNLOADER STDOUT]\n" + out, flush=True)
+        print("[YT-DLP STDOUT]\n" + out)
         if err:
-            print("[DOWNLOADER STDERR]\n" + err, flush=True)
+            print("[YT-DLP STDERR]\n" + err)
 
-        if "visionias" in cmd and process.returncode != 0 and failed_counter <= 10:
-            failed_counter += 1
-            await asyncio.sleep(5)
-            return await download_video(url, cmd, name)
+        if proc.returncode != 0:
+            if "visionias" in cmd.lower() and failed_counter < 10:
+                failed_counter += 1
+                await asyncio.sleep(5)
+                return await download_video(url, cmd, name)
+            failed_counter = 0
+            return None
 
         failed_counter = 0
-
-        candidates = [name]
-        candidates += [
-            f"{name}.webm",
-            f"{name}.mp4",
-            f"{name}.mkv",
-            f"{name}.mp4.webm",
+        candidates = [
+            name, f"{name}.mp4", f"{name}.mkv", f"{name}.webm",
+            f"{name}.mp4.webm"
         ]
-
         base = os.path.splitext(name)[0]
         candidates += [f"{base}.mp4", f"{base}.mkv", f"{base}.webm"]
 
-        for line in reversed(out.splitlines()):
-            candidate = line.strip().strip('"').strip("'")
-            if candidate:
-                candidates.insert(0, candidate)
-
         for candidate in candidates:
-            if (
-                isinstance(candidate, (str, bytes, os.PathLike))
-                and os.path.isfile(candidate)
-                and os.path.getsize(candidate) > 0
-            ):
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
                 return candidate
 
-        print(
-            f"❌ Downloader exited with code {process.returncode} "
-            "and produced no valid video file.",
-            flush=True,
-        )
+        for line in reversed((out + "\n" + err).splitlines()):
+            candidate = line.strip().strip('"').strip("'")
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                return candidate
+
+        print("❌ Downloader produced no valid video file.")
         return None
 
-    except Exception as e:
-        print(f"❌ Video download exception: {type(e).__name__}: {e}", flush=True)
+    except Exception as exc:
+        print(f"❌ Video download exception: {type(exc).__name__}: {exc}")
         logging.exception("Video download exception")
         return None
 
-import os
-import os
-import time
-import mmap
-import asyncio
-import requests
-import subprocess
-
-from tqdm import tqdm
-from pyrogram import Client
-from pyrogram.types import Message
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import requests
-import os
-from tqdm import tqdm
-import os
-import requests
-from tqdm import tqdm  # progress bar
 def create_session():
     session = requests.Session()
     retries = Retry(
@@ -698,11 +801,17 @@ def download_raw_file(url: str, filename: str) -> str | None:
                         f.write(chunk)
                         bar.update(len(chunk))
 
-        return file_path
+        if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+            return file_path
+
+        print("❌ Download completed but output file is empty.")
+        return None
 
     except Exception as e:
         print(f"⚠️ Download interrupted (resume enabled): {e}")
-        return file_path if os.path.exists(file_path) else None
+        if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+            return file_path
+        return None
 # ==============================
 # DOWNLOAD + DECRYPT WRAPPER
 # ==============================
@@ -759,23 +868,12 @@ import asyncio
 
 # 🔹 Async ffmpeg runner (NO BLOCKING)
 async def run_cmd(cmd: str):
-    print(f"▶️ CMD: {cmd}", flush=True)
     process = await asyncio.create_subprocess_shell(
         cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
     )
-    stdout, stderr = await process.communicate()
-
-    out = stdout.decode(errors="replace").strip()
-    err = stderr.decode(errors="replace").strip()
-
-    if out:
-        print("[CMD STDOUT]\n" + out, flush=True)
-    if err:
-        print("[CMD STDERR]\n" + err, flush=True)
-
-    return process.returncode, out, err
+    await process.communicate()
 
 
 async def send_vid(
@@ -789,21 +887,6 @@ async def send_vid(
     prog,
     channel_id
 ):
-    # ==========================
-    # INPUT VIDEO VALIDATION
-    # ==========================
-    if not isinstance(filename, (str, bytes, os.PathLike)):
-        await m.reply_text("❌ Video processing failed: downloader returned no file.")
-        return
-
-    if not os.path.isfile(filename):
-        await m.reply_text(f"❌ Video processing failed: file not found: `{filename}`")
-        return
-
-    if os.path.getsize(filename) <= 0:
-        await m.reply_text("❌ Video processing failed: downloaded file is empty.")
-        return
-
     # ==========================
     # THUMBNAIL GENERATION
     # ==========================
@@ -848,11 +931,8 @@ async def send_vid(
     # ==========================
     # SAFETY CHECK
     # ==========================
-    if not os.path.isfile(w_filename) or os.path.getsize(w_filename) <= 0:
-        await m.reply_text(
-            "❌ Video processing failed: FFmpeg could not create the processed video. "
-            "Check Render logs for [CMD STDERR]."
-        )
+    if not os.path.exists(w_filename):
+        await m.reply_text("❌ Video processing failed")
         return
 
     dur = int(duration(w_filename))
