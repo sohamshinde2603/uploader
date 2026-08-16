@@ -420,33 +420,82 @@ async def fetch_segment(session, seg_url, f):
             f.write(chunk)
 
 async def download_m3u8_async(url: str, filename: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13)",
-        "Referer": "https://player.akamai.net.in/",
-        "Origin": "https://player.akamai.net.in",
-        "Accept": "*/*"
-    }
+    """Download an accessible, non-DRM HLS/M3U8 stream with FFmpeg."""
     os.makedirs("downloads", exist_ok=True)
-    final_file = f"downloads/{filename}.mp4"
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        r = await session.get(url)
-        text = await r.text()
-        playlist_lines = text.splitlines()
-        segments = [urljoin(url, line) for line in playlist_lines if line and not line.startswith("#")]
+    safe_name = os.path.basename(str(filename))
+    safe_name = os.path.splitext(safe_name)[0]
+    final_file = os.path.abspath(os.path.join("downloads", safe_name + ".mp4"))
+    temp_file = final_file + ".part"
 
-        if not segments:
-            print("❌ No segments found!")
+    parsed = urlparse(url)
+    referer = f"{parsed.scheme}://{parsed.netloc}/" if parsed.netloc else ""
+
+    headers = (
+        "User-Agent: Mozilla/5.0\r\n"
+        "Accept: */*\r\n"
+    )
+    if referer:
+        headers += f"Referer: {referer}\r\n"
+        headers += f"Origin: {parsed.scheme}://{parsed.netloc}\r\n"
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+        "-headers", headers,
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+        "-allowed_extensions", "ALL",
+        "-i", url,
+        "-map", "0:v:0?",
+        "-map", "0:a:0?",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        temp_file,
+    ]
+
+    print(f"🎬 HLS download: {url}", flush=True)
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        out = stdout.decode(errors="replace").strip()
+        err = stderr.decode(errors="replace").strip()
+
+        if out:
+            print("[FFMPEG STDOUT]\n" + out, flush=True)
+        if err:
+            print("[FFMPEG STDERR]\n" + err, flush=True)
+
+        if process.returncode != 0:
+            print(f"❌ FFmpeg exited with code {process.returncode}", flush=True)
             return None
 
-        print(f"🚀 Downloading {len(segments)} segments for {filename}...")
+        if not os.path.isfile(temp_file) or os.path.getsize(temp_file) <= 0:
+            print("❌ FFmpeg created no output file.", flush=True)
+            return None
 
-        with open(final_file, "wb") as f:
-            tasks = [fetch_segment(session, seg_url, f) for seg_url in segments]
-            await asyncio.gather(*tasks)
-
-        print(f"\n✅ Full video downloaded: {final_file}")
+        os.replace(temp_file, final_file)
+        print(
+            f"✅ HLS output: {final_file} "
+            f"({os.path.getsize(final_file)} bytes)",
+            flush=True,
+        )
         return final_file
+
+    except Exception as e:
+        print(f"❌ HLS exception: {type(e).__name__}: {e}", flush=True)
+        logging.exception("HLS download exception")
+        return None
+    finally:
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
 
 # Run
 # asyncio.run(download_m3u8_async("your_m3u8_url", "video_name"))
@@ -456,43 +505,95 @@ import subprocess
 import logging
 
 async def download_video(url, cmd, name):
-    if "transcoded" in url.lower():
-        print(f"⚡ Transcoded URL detected → using download_m3u8 for {name}")
-        return download_m3u8(url, name)
-    
-    download_cmd = f'{cmd} -R 25 --fragment-retries 25 --external-downloader aria2c --downloader-args "aria2c: -x 16 -j 32"'
     global failed_counter
-    print(download_cmd)
-    logging.info(download_cmd)
-
-    k = subprocess.run(download_cmd, shell=True)
-
-    if "visionias" in cmd and k.returncode != 0 and failed_counter <= 10:
-        failed_counter += 1
-        await asyncio.sleep(5)
-        return await download_video(url, cmd, name)
-
-    failed_counter = 0
 
     try:
-        if os.path.isfile(name):
-            return name
-        elif os.path.isfile(f"{name}.webm"):
-            return f"{name}.webm"
+        lower_url = str(url).lower()
 
-        base = name.split(".")[0]
+        # ClassPlus HLS route. This is ordinary HLS handling only; it does
+        # not bypass DRM/license protection.
+        if (
+            ".m3u8" in lower_url
+            or "media-cdn.classplusapp.com" in lower_url
+        ):
+            print(f"🎬 ClassPlus HLS detected → {name}", flush=True)
+            result = await download_m3u8_async(url, name)
 
-        if os.path.isfile(f"{base}.mkv"):
-            return f"{base}.mkv"
-        elif os.path.isfile(f"{base}.mp4"):
-            return f"{base}.mp4"
-        elif os.path.isfile(f"{base}.mp4.webm"):
-            return f"{base}.mp4.webm"
+            if (
+                isinstance(result, (str, bytes, os.PathLike))
+                and os.path.isfile(result)
+                and os.path.getsize(result) > 0
+            ):
+                return result
 
-        return name
+            print("❌ ClassPlus HLS produced no valid file.", flush=True)
+            return None
 
-    except FileNotFoundError:
-        return os.path.splitext(name)[0] + ".mp4"
+        print(f"▶️ Running downloader for: {name}", flush=True)
+        print(download_cmd := (
+            f'{cmd} -R 25 --fragment-retries 25 '
+            f'--external-downloader aria2c '
+            f'--downloader-args "aria2c: -x 16 -j 32"'
+        ), flush=True)
+
+        process = await asyncio.create_subprocess_shell(
+            download_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        out = stdout.decode(errors="replace")
+        err = stderr.decode(errors="replace")
+
+        if out:
+            print("[DOWNLOADER STDOUT]\n" + out, flush=True)
+        if err:
+            print("[DOWNLOADER STDERR]\n" + err, flush=True)
+
+        if "visionias" in cmd and process.returncode != 0 and failed_counter <= 10:
+            failed_counter += 1
+            await asyncio.sleep(5)
+            return await download_video(url, cmd, name)
+
+        failed_counter = 0
+
+        candidates = [name]
+        candidates += [
+            f"{name}.webm",
+            f"{name}.mp4",
+            f"{name}.mkv",
+            f"{name}.mp4.webm",
+        ]
+
+        base = os.path.splitext(name)[0]
+        candidates += [f"{base}.mp4", f"{base}.mkv", f"{base}.webm"]
+
+        for line in reversed(out.splitlines()):
+            candidate = line.strip().strip('"').strip("'")
+            if candidate:
+                candidates.insert(0, candidate)
+
+        for candidate in candidates:
+            if (
+                isinstance(candidate, (str, bytes, os.PathLike))
+                and os.path.isfile(candidate)
+                and os.path.getsize(candidate) > 0
+            ):
+                return candidate
+
+        print(
+            f"❌ Downloader exited with code {process.returncode} "
+            "and produced no valid video file.",
+            flush=True,
+        )
+        return None
+
+    except Exception as e:
+        print(f"❌ Video download exception: {type(e).__name__}: {e}", flush=True)
+        logging.exception("Video download exception")
+        return None
+
 import os
 import os
 import time
@@ -658,12 +759,23 @@ import asyncio
 
 # 🔹 Async ffmpeg runner (NO BLOCKING)
 async def run_cmd(cmd: str):
+    print(f"▶️ CMD: {cmd}", flush=True)
     process = await asyncio.create_subprocess_shell(
         cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    await process.communicate()
+    stdout, stderr = await process.communicate()
+
+    out = stdout.decode(errors="replace").strip()
+    err = stderr.decode(errors="replace").strip()
+
+    if out:
+        print("[CMD STDOUT]\n" + out, flush=True)
+    if err:
+        print("[CMD STDERR]\n" + err, flush=True)
+
+    return process.returncode, out, err
 
 
 async def send_vid(
@@ -677,6 +789,21 @@ async def send_vid(
     prog,
     channel_id
 ):
+    # ==========================
+    # INPUT VIDEO VALIDATION
+    # ==========================
+    if not isinstance(filename, (str, bytes, os.PathLike)):
+        await m.reply_text("❌ Video processing failed: downloader returned no file.")
+        return
+
+    if not os.path.isfile(filename):
+        await m.reply_text(f"❌ Video processing failed: file not found: `{filename}`")
+        return
+
+    if os.path.getsize(filename) <= 0:
+        await m.reply_text("❌ Video processing failed: downloaded file is empty.")
+        return
+
     # ==========================
     # THUMBNAIL GENERATION
     # ==========================
@@ -721,8 +848,11 @@ async def send_vid(
     # ==========================
     # SAFETY CHECK
     # ==========================
-    if not os.path.exists(w_filename):
-        await m.reply_text("❌ Video processing failed")
+    if not os.path.isfile(w_filename) or os.path.getsize(w_filename) <= 0:
+        await m.reply_text(
+            "❌ Video processing failed: FFmpeg could not create the processed video. "
+            "Check Render logs for [CMD STDERR]."
+        )
         return
 
     dur = int(duration(w_filename))
