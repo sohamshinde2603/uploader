@@ -398,7 +398,7 @@ def time_name():
     return f"{date} {current_time}.mp4"
 
 import os, re, asyncio, aiohttp
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 async def fetch_segment(session, seg_url, headers):
     async with session.get(seg_url, headers=headers, timeout=30) as resp:
@@ -420,76 +420,33 @@ async def fetch_segment(session, seg_url, f):
             f.write(chunk)
 
 async def download_m3u8_async(url: str, filename: str):
-    """Download an accessible HLS/M3U8 stream with FFmpeg.
-
-    This handles normal HLS playlists (including master playlists) and lets
-    FFmpeg resolve the playlist, variants, segments and standard HLS keys.
-    It does not bypass DRM/license systems.
-    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13)",
+        "Referer": "https://player.akamai.net.in/",
+        "Origin": "https://player.akamai.net.in",
+        "Accept": "*/*"
+    }
     os.makedirs("downloads", exist_ok=True)
-    final_file = os.path.abspath(f"downloads/{filename}.mp4")
-    temp_file = final_file + ".part"
+    final_file = f"downloads/{filename}.mp4"
 
-    headers = (
-        "User-Agent: Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36\r\n"
-        "Accept: */*\r\n"
-    )
+    async with aiohttp.ClientSession(headers=headers) as session:
+        r = await session.get(url)
+        text = await r.text()
+        playlist_lines = text.splitlines()
+        segments = [urljoin(url, line) for line in playlist_lines if line and not line.startswith("#")]
 
-    # ClassPlus HLS commonly needs the CDN origin/referer to be preserved.
-    parsed = urlparse(url)
-    if parsed.netloc:
-        headers += f"Origin: https://{parsed.netloc}\r\n"
-        headers += f"Referer: https://{parsed.netloc}/\r\n"
+        if not segments:
+            print("❌ No segments found!")
+            return None
 
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-y",
-        "-headers", headers,
-        "-allowed_extensions", "ALL",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        "-i", url,
-        "-map", "0:v:0?",
-        "-map", "0:a:0?",
-        "-c", "copy",
-        "-movflags", "+faststart",
-        temp_file,
-    ]
+        print(f"🚀 Downloading {len(segments)} segments for {filename}...")
 
-    print(f"🎬 HLS download: {url}")
-    print("▶️ FFmpeg:", " ".join(f'"{x}"' if " " in x else x for x in cmd))
+        with open(final_file, "wb") as f:
+            tasks = [fetch_segment(session, seg_url, f) for seg_url in segments]
+            await asyncio.gather(*tasks)
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
-
-    err = stderr.decode(errors="replace").strip()
-    if stdout:
-        print(stdout.decode(errors="replace"))
-
-    if err:
-        print("[FFMPEG STDERR]")
-        print(err)
-
-    if process.returncode != 0:
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-        print(f"❌ FFmpeg exited with code {process.returncode}")
-        return None
-
-    if not os.path.isfile(temp_file) or os.path.getsize(temp_file) == 0:
-        print("❌ FFmpeg did not create a valid output file.")
-        return None
-
-    os.replace(temp_file, final_file)
-    print(
-        f"✅ HLS video ready: {final_file} "
-        f"({os.path.getsize(final_file)} bytes)"
-    )
-    return final_file
+        print(f"\n✅ Full video downloaded: {final_file}")
+        return final_file
 
 # Run
 # asyncio.run(download_m3u8_async("your_m3u8_url", "video_name"))
@@ -499,101 +456,43 @@ import subprocess
 import logging
 
 async def download_video(url, cmd, name):
+    if "transcoded" in url.lower():
+        print(f"⚡ Transcoded URL detected → using download_m3u8 for {name}")
+        return download_m3u8(url, name)
+    
+    download_cmd = f'{cmd} -R 25 --fragment-retries 25 --external-downloader aria2c --downloader-args "aria2c: -x 16 -j 32"'
     global failed_counter
+    print(download_cmd)
+    logging.info(download_cmd)
+
+    k = subprocess.run(download_cmd, shell=True)
+
+    if "visionias" in cmd and k.returncode != 0 and failed_counter <= 10:
+        failed_counter += 1
+        await asyncio.sleep(5)
+        return await download_video(url, cmd, name)
+
+    failed_counter = 0
 
     try:
-        lower_url = url.lower()
+        if os.path.isfile(name):
+            return name
+        elif os.path.isfile(f"{name}.webm"):
+            return f"{name}.webm"
 
-        # ClassPlus CDN HLS: handle master.m3u8 / any .m3u8 directly.
-        # Keep this separate from the existing AppX/ZIP/MKV routes.
-        if (
-            ".m3u8" in lower_url
-            or "media-cdn.classplusapp.com" in lower_url
-        ):
-            print(f"🎬 ClassPlus HLS detected → {name}")
-            result = await download_m3u8_async(url, name)
+        base = name.split(".")[0]
 
-            if (
-                isinstance(result, (str, bytes, os.PathLike))
-                and os.path.isfile(result)
-                and os.path.getsize(result) > 0
-            ):
-                return result
+        if os.path.isfile(f"{base}.mkv"):
+            return f"{base}.mkv"
+        elif os.path.isfile(f"{base}.mp4"):
+            return f"{base}.mp4"
+        elif os.path.isfile(f"{base}.mp4.webm"):
+            return f"{base}.mp4.webm"
 
-            print("❌ ClassPlus HLS did not produce a valid video file.")
-            return None
+        return name
 
-        # Preserve the existing downloader for all non-ClassPlus URLs.
-        download_cmd = (
-            f'{cmd} -R 25 --fragment-retries 25 '
-            f'--external-downloader aria2c '
-            f'--downloader-args "aria2c: -x 16 -j 32"'
-        )
-
-        print(download_cmd)
-        logging.info(download_cmd)
-
-        proc = await asyncio.create_subprocess_shell(
-            download_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-
-        out = stdout.decode(errors="replace")
-        err = stderr.decode(errors="replace")
-        if out:
-            print(out)
-        if err:
-            print(err)
-
-        if (
-            "visionias" in cmd
-            and proc.returncode != 0
-            and failed_counter <= 10
-        ):
-            failed_counter += 1
-            await asyncio.sleep(5)
-            return await download_video(url, cmd, name)
-
-        failed_counter = 0
-
-        candidates = [
-            name,
-            f"{name}.webm",
-            f"{name}.mp4",
-            f"{name}.mkv",
-            f"{name}.mp4.webm",
-            f"{os.path.splitext(name)[0]}.mp4",
-            f"{os.path.splitext(name)[0]}.mkv",
-            f"{os.path.splitext(name)[0]}.webm",
-        ]
-
-        # Also inspect yt-dlp output for a concrete final path.
-        for line in reversed(out.splitlines()):
-            candidate = line.strip().strip('"').strip("'")
-            if candidate:
-                candidates.insert(0, candidate)
-
-        for candidate in candidates:
-            if (
-                isinstance(candidate, (str, bytes, os.PathLike))
-                and os.path.isfile(candidate)
-                and os.path.getsize(candidate) > 0
-            ):
-                return candidate
-
-        print(
-            f"❌ Downloader finished with return code {proc.returncode}, "
-            "but no video file was created."
-        )
-        return None
-
-    except Exception as e:
-        print(f"❌ Video download exception: {type(e).__name__}: {e}")
-        logging.exception("Video download exception")
-        return None
-
+    except FileNotFoundError:
+        return os.path.splitext(name)[0] + ".mp4"
 import os
 import os
 import time
@@ -778,21 +677,6 @@ async def send_vid(
     prog,
     channel_id
 ):
-    # ==========================
-    # OUTPUT FILE SAFETY CHECK
-    # ==========================
-    if not isinstance(filename, (str, bytes, os.PathLike)):
-        await m.reply_text("❌ Video download failed: no output file was created.")
-        return
-
-    if not os.path.isfile(filename):
-        await m.reply_text(f"❌ Video file not found: `{filename}`")
-        return
-
-    if os.path.getsize(filename) <= 0:
-        await m.reply_text("❌ Video file is empty.")
-        return
-
     # ==========================
     # THUMBNAIL GENERATION
     # ==========================
