@@ -371,6 +371,14 @@ async def drm_handler(bot: Client, m: Message):
 
                 res = cp_response.json()
 
+                # ClassPlus diagnostics: expose the actual API error returned
+                # by the server instead of only printing ['error'].
+                print("========== CLASSPLUS API DEBUG ==========", flush=True)
+                print(f"HTTP STATUS: {cp_response.status_code}", flush=True)
+                print(f"RESPONSE: {cp_response.text[:5000]}", flush=True)
+                print("=========================================", flush=True)
+
+
                 
 
                 # Use the media URL returned by the authenticated ClassPlus endpoint.
@@ -417,11 +425,32 @@ async def drm_handler(bot: Client, m: Message):
 
                     else:
 
+                        error_detail = res.get("error")
+
+                        if isinstance(error_detail, dict):
+                            error_detail = (
+                                error_detail.get("message")
+                                or error_detail.get("msg")
+                                or error_detail.get("error")
+                                or str(error_detail)
+                            )
+
+                        if not error_detail:
+                            error_detail = (
+                                res.get("message")
+                                or res.get("msg")
+                                or str(res)
+                            )
+
+                        print(
+                            f"❌ ClassPlus API error details: {error_detail}",
+                            flush=True,
+                        )
+
                         raise ValueError(
-
-                            f"ClassPlus API returned no media URL. "
-
-                            f"Response keys: {list(res.keys())[:20]}"
+                            "ClassPlus API rejected the request: "
+                            f"{error_detail}"
+                        ))[:20]}"
 
                         )
 
