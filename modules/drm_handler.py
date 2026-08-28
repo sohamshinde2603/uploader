@@ -356,107 +356,77 @@ async def drm_handler(bot: Client, m: Message):
                 }
 
                 cp_response = requests.get(
-
                     "https://api.classplusapp.com/cams/uploader/video/jw-signed-url",
-
                     params=params,
-
                     headers=headers,
-
                     timeout=20,
-
                 )
 
-                cp_response.raise_for_status()
+                print(
+                    f"[ClassPlus] HTTP {cp_response.status_code}",
+                    flush=True,
+                )
+                print(
+                    f"[ClassPlus] Response: {cp_response.text[:3000]}",
+                    flush=True,
+                )
 
-                res = cp_response.json()
-
-                # ClassPlus diagnostics: expose the actual API error returned
-                # by the server instead of only printing ['error'].
-                print("========== CLASSPLUS API DEBUG ==========", flush=True)
-                print(f"HTTP STATUS: {cp_response.status_code}", flush=True)
-                print(f"RESPONSE: {cp_response.text[:5000]}", flush=True)
-                print("=========================================", flush=True)
-
-
-                
-
-                # Use the media URL returned by the authenticated ClassPlus endpoint.
-
-                # This does not bypass DRM/license protection.
-
-                if isinstance(res, dict):
-
-                    signed_url = (
-
-                        res.get("url")
-
-                        or res.get("video_url")
-
-                        or res.get("signed_url")
-
-                        or res.get("signedUrl")
-
+                try:
+                    cp_data = cp_response.json()
+                except ValueError:
+                    raise RuntimeError(
+                        f"ClassPlus returned non-JSON response "
+                        f"(HTTP {cp_response.status_code})"
                     )
 
-                    if not (isinstance(signed_url, str) and signed_url.strip()):
+                if not cp_response.ok:
+                    error = cp_data.get("error", cp_data) if isinstance(cp_data, dict) else cp_data
+                    if isinstance(error, dict):
+                        error = (
+                            error.get("message")
+                            or error.get("msg")
+                            or error.get("error")
+                            or str(error)
+                        )
+                    raise RuntimeError(
+                        f"ClassPlus API HTTP {cp_response.status_code}: {error}"
+                    )
 
-                        data = res.get("data")
-
-                        if isinstance(data, dict):
-
-                            signed_url = (
-
-                                data.get("url")
-
-                                or data.get("video_url")
-
-                                or data.get("signed_url")
-
-                                or data.get("signedUrl")
-
-                            )
-
-                    if isinstance(signed_url, str) and signed_url.strip():
-
-                        url = signed_url.strip()
-
-                        print("✅ ClassPlus signed media URL received.", flush=True)
-
-                    else:
-
-                        error_detail = res.get("error")
-
-                        if isinstance(error_detail, dict):
-                            error_detail = (
-                                error_detail.get("message")
-                                or error_detail.get("msg")
-                                or error_detail.get("error")
-                                or str(error_detail)
-                            )
-
-                        if not error_detail:
-                            error_detail = (
-                                res.get("message")
-                                or res.get("msg")
-                                or str(res)
-                            )
-
-                        print(
-                            f"❌ ClassPlus API error details: {error_detail}",
-                            flush=True,
+                signed_url = None
+                if isinstance(cp_data, dict):
+                    signed_url = (
+                        cp_data.get("url")
+                        or cp_data.get("video_url")
+                        or cp_data.get("signed_url")
+                        or cp_data.get("signedUrl")
+                    )
+                    data = cp_data.get("data")
+                    if not signed_url and isinstance(data, dict):
+                        signed_url = (
+                            data.get("url")
+                            or data.get("video_url")
+                            or data.get("signed_url")
+                            or data.get("signedUrl")
                         )
 
-                        raise ValueError(
-                            "ClassPlus API rejected the request: "
-                            f"{error_detail}"
-                        ))[:20]}"
-
+                if not isinstance(signed_url, str) or not signed_url.strip():
+                    error = cp_data.get("error", "No media URL returned") if isinstance(cp_data, dict) else str(cp_data)
+                    if isinstance(error, dict):
+                        error = (
+                            error.get("message")
+                            or error.get("msg")
+                            or error.get("error")
+                            or str(error)
                         )
+                    raise RuntimeError(
+                        f"ClassPlus API returned no media URL: {error}"
+                    )
 
-                else:
-
-                    raise ValueError("ClassPlus API returned an unexpected response.")
+                url = signed_url.strip()
+                print("[ClassPlus] Authorized media URL received.", flush=True)
+                # The returned URL is now the actual media URL used by the
+                # normal downloader below.
+                ytf = youtube_format(raw_text2)
 
             if "edge.api.brightcove.com" in url:
                 bcov = f'bcov_auth={cwtoken}'
