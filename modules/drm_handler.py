@@ -521,32 +521,150 @@ async def drm_handler(bot: Client, m: Message):
                     final_url = url
                     need_referer = False
                     namef = name1
-                    if "appxsignurl.vercel.app/appx/" in url:
+                    if "appxsignurl.vercel.app/appx/" in url.lower():
                         try:
-                            # Step 1: Directly use the original URL
-                            response = requests.get(url.strip(), timeout=10)
-                            data = response.json()
+                            appx_sign_url = url.strip()
 
-                            # Step 2: Extract actual PDF URL
-                            pdf_url = data.get("pdf_url")
-                            if pdf_url:
-                                url = pdf_url.strip()   # overwrite with real downloadable link
+                            headers = {
+                                "User-Agent": (
+                                    "Mozilla/5.0 (Linux; Android 13) "
+                                    "AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36"
+                                ),
+                                "Accept": "application/pdf,application/json,text/plain,*/*",
+                                "Referer": "https://appxsignurl.vercel.app/",
+                            }
+
+                            response = requests.get(
+                                appx_sign_url,
+                                headers=headers,
+                                timeout=30,
+                                allow_redirects=True,
+                            )
+
+                            print(
+                                f"[AppXSignURL] status={response.status_code} "
+                                f"content-type={response.headers.get('content-type')}",
+                                flush=True,
+                            )
+
+                            # A successful signed endpoint may return the PDF
+                            # itself. Save only an actual PDF.
+                            if response.status_code == 200:
+                                content_type = (
+                                    response.headers.get("content-type") or ""
+                                ).lower()
+
+                                if (
+                                    response.content.startswith(b"%PDF-")
+                                    or "application/pdf" in content_type
+                                ):
+                                    pdf_path = f"{name1}.pdf"
+                                    with open(pdf_path, "wb") as fh:
+                                        fh.write(response.content)
+
+                                    if os.path.getsize(pdf_path) == 0:
+                                        raise RuntimeError(
+                                            "AppXSignURL returned an empty PDF."
+                                        )
+
+                                    # Pass the local file path directly to the
+                                    # send step instead of sending the remote URL
+                                    # to yt-dlp.
+                                    url = pdf_path
+                                    namef = name1
+                                    need_referer = False
+                                else:
+                                    # Some versions return JSON describing the
+                                    # actual PDF URL.
+                                    try:
+                                        payload = response.json()
+                                    except ValueError:
+                                        payload = None
+
+                                    pdf_url = None
+                                    if isinstance(payload, dict):
+                                        pdf_url = (
+                                            payload.get("pdf_url")
+                                            or payload.get("download_url")
+                                            or payload.get("file_url")
+                                            or payload.get("media_url")
+                                            or payload.get("url")
+                                        )
+
+                                        nested = payload.get("data")
+                                        if not pdf_url and isinstance(nested, dict):
+                                            pdf_url = (
+                                                nested.get("pdf_url")
+                                                or nested.get("download_url")
+                                                or nested.get("file_url")
+                                                or nested.get("media_url")
+                                                or nested.get("url")
+                                            )
+
+                                    if not isinstance(pdf_url, str) or not pdf_url.strip():
+                                        raise RuntimeError(
+                                            "AppXSignURL returned HTTP 200 but "
+                                            "did not provide a PDF or downloadable "
+                                            f"PDF URL. Response: {payload!r}"
+                                        )
+
+                                    pdf_url = pdf_url.strip()
+
+                                    pdf_response = requests.get(
+                                        pdf_url,
+                                        headers=headers,
+                                        timeout=30,
+                                        allow_redirects=True,
+                                    )
+
+                                    if pdf_response.status_code >= 400:
+                                        raise RuntimeError(
+                                            f"Resolved PDF URL returned HTTP "
+                                            f"{pdf_response.status_code}"
+                                        )
+
+                                    if not pdf_response.content.startswith(b"%PDF-"):
+                                        raise RuntimeError(
+                                            "Resolved AppX URL did not return a valid PDF."
+                                        )
+
+                                    pdf_path = f"{name1}.pdf"
+                                    with open(pdf_path, "wb") as fh:
+                                        fh.write(pdf_response.content)
+
+                                    url = pdf_path
+                                    namef = name1
+                                    need_referer = False
+
+                            elif response.status_code == 402:
+                                try:
+                                    detail = response.text[:2000]
+                                except Exception:
+                                    detail = ""
+
+                                raise RuntimeError(
+                                    "AppXSignURL returned HTTP 402 "
+                                    "(Payment Required). "
+                                    f"{detail}"
+                                )
+
                             else:
-                                print("No pdf_url found in response JSON.")
-                                # fallback: keep original URL
-                                # url remains unchanged
+                                try:
+                                    detail = response.text[:2000]
+                                except Exception:
+                                    detail = ""
 
-                            # Step 3: Extract title if available
-                            namef = data.get("title", name1)
+                                raise RuntimeError(
+                                    f"AppXSignURL returned HTTP "
+                                    f"{response.status_code}: {detail}"
+                                )
 
-                            # Step 4: Mark referer requirement
-                            need_referer = True
                         except Exception as e:
-                            print(f"Error fetching AppxSignURL JSON: {e}")
-                            need_referer = True
-                            namef = name1
-                    
-
+                            print(
+                                f"[AppXSignURL] PDF download failed: {e}",
+                                flush=True,
+                            )
+                            raise
                     elif "static-db.appx.co.in" in url:
                            
                            need_referer = True
@@ -625,19 +743,29 @@ async def drm_handler(bot: Client, m: Message):
                             # -----------------------------------------
                             # DOWNLOAD PDF
                             # -----------------------------------------
-                            os.system(download_cmd)
+                            if os.path.isfile(url) and os.path.getsize(url) > 0:
+                                pdf_file = url
+                            else:
+                                os.system(download_cmd)
+                                pdf_file = f"{namef}.pdf"
+
+                            # Never upload a path that was not actually created.
+                            if not os.path.isfile(pdf_file) or os.path.getsize(pdf_file) <= 0:
+                                raise RuntimeError(
+                                    f"PDF download produced no valid file: {pdf_file}"
+                                )
 
                             # -----------------------------------------
                             # SEND PDF
                             # -----------------------------------------
                             copy = await bot.send_document(
                                 chat_id=channel_id,
-                                document=f"{namef}.pdf",
+                                document=pdf_file,
                                 caption=cc1
                             )
 
                             count += 1
-                            os.remove(f"{namef}.pdf")
+                            os.remove(pdf_file)
 
                         except FloodWait as e:
                             await m.reply_text(str(e))
