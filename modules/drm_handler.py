@@ -521,106 +521,32 @@ async def drm_handler(bot: Client, m: Message):
                     final_url = url
                     need_referer = False
                     namef = name1
-                    if "appxsignurl.vercel.app/appx/" in url.lower():
+                    if "appxsignurl.vercel.app/appx/" in url:
                         try:
-                            appx_url = url.strip()
+                            # Step 1: Directly use the original URL
+                            response = requests.get(url.strip(), timeout=10)
+                            data = response.json()
 
-                            response = requests.get(
-                                appx_url,
-                                headers={
-                                    "User-Agent": (
-                                        "Mozilla/5.0 (Linux; Android 12) "
-                                        "AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36"
-                                    ),
-                                    "Accept": (
-                                        "application/pdf,application/json,"
-                                        "text/plain,*/*"
-                                    ),
-                                    "Referer": "https://appxsignurl.vercel.app/",
-                                },
-                                timeout=30,
-                                allow_redirects=True,
-                            )
-
-                            print(
-                                f"[AppXSignURL] HTTP {response.status_code}",
-                                flush=True,
-                            )
-
-                            if response.status_code >= 400:
-                                try:
-                                    detail = response.text[:3000]
-                                except Exception:
-                                    detail = ""
-
-                                raise RuntimeError(
-                                    f"AppXSignURL returned HTTP "
-                                    f"{response.status_code}: {detail}"
-                                )
-
-                            content_type = (
-                                response.headers.get("content-type") or ""
-                            ).lower()
-
-                            if (
-                                response.content.startswith(b"%PDF-")
-                                or "application/pdf" in content_type
-                            ):
-                                output_pdf = f"{name1}.pdf"
-                                with open(output_pdf, "wb") as fh:
-                                    fh.write(response.content)
-
-                                url = output_pdf
-                                namef = name1
-                                need_referer = False
-
+                            # Step 2: Extract actual PDF URL
+                            pdf_url = data.get("pdf_url")
+                            if pdf_url:
+                                url = pdf_url.strip()   # overwrite with real downloadable link
                             else:
-                                try:
-                                    data = response.json()
-                                except ValueError:
-                                    data = None
+                                print("No pdf_url found in response JSON.")
+                                # fallback: keep original URL
+                                # url remains unchanged
 
-                                pdf_url = None
-                                if isinstance(data, dict):
-                                    pdf_url = (
-                                        data.get("pdf_url")
-                                        or data.get("download_url")
-                                        or data.get("file_url")
-                                        or data.get("media_url")
-                                        or data.get("url")
-                                    )
+                            # Step 3: Extract title if available
+                            namef = data.get("title", name1)
 
-                                    nested = data.get("data")
-                                    if not pdf_url and isinstance(nested, dict):
-                                        pdf_url = (
-                                            nested.get("pdf_url")
-                                            or nested.get("download_url")
-                                            or nested.get("file_url")
-                                            or nested.get("media_url")
-                                            or nested.get("url")
-                                        )
-
-                                    namef = data.get("title", name1) or name1
-
-                                if not (
-                                    isinstance(pdf_url, str)
-                                    and pdf_url.strip()
-                                ):
-                                    raise RuntimeError(
-                                        "AppXSignURL returned neither a PDF "
-                                        "nor a downloadable PDF URL. "
-                                        f"Response: {data!r}"
-                                    )
-
-                                url = pdf_url.strip()
-                                need_referer = True
-
+                            # Step 4: Mark referer requirement
+                            need_referer = True
                         except Exception as e:
-                            print(
-                                f"[AppXSignURL] PDF resolution failed: {e}",
-                                flush=True,
-                            )
-                            raise
+                            print(f"Error fetching AppxSignURL JSON: {e}")
+                            need_referer = True
+                            namef = name1
+                    
+
                     elif "static-db.appx.co.in" in url:
                            
                            need_referer = True
