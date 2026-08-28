@@ -130,6 +130,14 @@ def _download_pdf_url(url, output_path, referer=None):
 
     for _ in range(4):
         response = session.get(current, headers=headers, timeout=30, allow_redirects=True)
+        # A 402 from the AppX signing/proxy host means the proxy itself
+        # refused the request. Keep the exception informative so the caller
+        # can decide whether to try the underlying AppX origin URL.
+        if response.status_code == 402:
+            raise requests.HTTPError(
+                f"402 Payment Required from AppX signing proxy: {current}",
+                response=response,
+            )
         response.raise_for_status()
         content_type = (response.headers.get("content-type") or "").lower()
         body = response.content
@@ -683,12 +691,47 @@ async def drm_handler(bot: Client, m: Message):
 
                     try:
                         if "appxsignurl.vercel.app/appx/" in original_url.lower():
-                            resolved_url = _download_pdf_url(
-                                original_url,
-                                output_pdf,
-                                referer="https://appxsignurl.vercel.app/",
-                            )
-                            print(f"[AppX PDF] Resolved: {resolved_url}", flush=True)
+                            try:
+                                resolved_url = _download_pdf_url(
+                                    original_url,
+                                    output_pdf,
+                                    referer="https://appxsignurl.vercel.app/",
+                                )
+                                print(f"[AppX PDF] Proxy resolved: {resolved_url}", flush=True)
+                            except requests.HTTPError as proxy_err:
+                                response = getattr(proxy_err, "response", None)
+                                status = getattr(response, "status_code", None)
+                                if status != 402:
+                                    raise
+
+                                # The signing host is only a proxy wrapper around
+                                # the AppX origin. If that proxy answers 402, try
+                                # the origin encoded in /appx/<host>/... using
+                                # the same signed query string. This does NOT
+                                # alter/re-sign the token.
+                                parsed = urlparse(original_url)
+                                parts = parsed.path.split("/")
+                                if len(parts) < 4 or parts[1].lower() != "appx" or not parts[2]:
+                                    raise RuntimeError(
+                                        "AppX signing proxy returned 402 and the underlying origin could not be parsed."
+                                    ) from proxy_err
+
+                                origin_host = parts[2]
+                                origin_path = "/" + "/".join(parts[3:])
+                                origin_url = f"https://{origin_host}{origin_path}"
+                                if parsed.query:
+                                    origin_url += "?" + parsed.query
+
+                                print(
+                                    f"[AppX PDF] Signing proxy returned 402; trying authorized origin: {origin_host}",
+                                    flush=True,
+                                )
+                                resolved_url = _download_pdf_url(
+                                    origin_url,
+                                    output_pdf,
+                                    referer="https://appxsignurl.vercel.app/",
+                                )
+                                print(f"[AppX PDF] Origin resolved: {resolved_url}", flush=True)
                         elif "cwmediabkt99" in original_url:
                             scraper = cloudscraper.create_scraper()
                             response = scraper.get(
