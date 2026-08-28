@@ -116,9 +116,12 @@ def _first_url_from_appx_payload(payload):
 
 
 def _download_pdf_url(url, output_path, referer=None):
-    """Download an ordinary/authenticated PDF URL and validate the file."""
+    """Download a directly accessible PDF or follow a JSON URL response."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 12) "
+            "AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36"
+        ),
         "Accept": "application/pdf,application/json,text/plain,*/*",
     }
     if referer:
@@ -126,29 +129,41 @@ def _download_pdf_url(url, output_path, referer=None):
 
     session = requests.Session()
     current = url.strip()
-    last_error = None
 
     for _ in range(4):
-        response = session.get(current, headers=headers, timeout=30, allow_redirects=True)
-        # A 402 from the AppX signing/proxy host means the proxy itself
-        # refused the request. Keep the exception informative so the caller
-        # can decide whether to try the underlying AppX origin URL.
-        if response.status_code == 402:
+        response = session.get(
+            current,
+            headers=headers,
+            timeout=30,
+            allow_redirects=True,
+        )
+
+        # Preserve the exact server-side status.
+        if response.status_code >= 400:
+            try:
+                detail = response.text[:2000]
+            except Exception:
+                detail = ""
             raise requests.HTTPError(
-                f"402 Payment Required from AppX signing proxy: {current}",
+                f"HTTP {response.status_code} for {current}: {detail}",
                 response=response,
             )
-        response.raise_for_status()
-        content_type = (response.headers.get("content-type") or "").lower()
+
+        content_type = (
+            response.headers.get("content-type") or ""
+        ).lower()
         body = response.content
 
-        if body.startswith(b"%PDF-") or "application/pdf" in content_type:
+        if body.startswith(b"%PDF-"):
             with open(output_path, "wb") as fh:
                 fh.write(body)
-            if os.path.getsize(output_path) == 0:
+
+            if os.path.getsize(output_path) <= 0:
                 raise RuntimeError("AppX returned an empty PDF.")
+
             return response.url
 
+        # Some AppX wrappers return JSON containing the actual URL.
         try:
             payload = response.json()
         except ValueError:
@@ -159,25 +174,26 @@ def _download_pdf_url(url, output_path, referer=None):
             if next_url and next_url != current:
                 current = next_url
                 continue
-            last_error = payload
-            break
 
-        text = response.text.strip()
-        match = re.search(r'https?://[^\s"\'<>]+', text)
-        if match:
-            next_url = match.group(0).rstrip()
-            if next_url != current:
-                current = next_url
-                continue
+            if isinstance(payload, dict):
+                error = (
+                    payload.get("error")
+                    or payload.get("message")
+                    or payload.get("msg")
+                    or payload
+                )
+                raise RuntimeError(
+                    f"AppX PDF endpoint returned JSON but no PDF URL: {error}"
+                )
 
-        last_error = f"HTTP {response.status_code}, content-type={content_type}, first-bytes={body[:40]!r}"
-        break
+        # Otherwise don't save HTML/text as a PDF.
+        raise RuntimeError(
+            "AppX PDF endpoint did not return a PDF. "
+            f"Content-Type={content_type}; "
+            f"first bytes={body[:80]!r}"
+        )
 
-    if isinstance(last_error, dict):
-        err = last_error.get("error") or last_error.get("message") or last_error.get("msg") or last_error
-    else:
-        err = last_error or "No PDF URL was returned."
-    raise RuntimeError(f"AppX PDF endpoint did not return a downloadable PDF: {err}")
+    raise RuntimeError("Too many AppX PDF redirects/resolution attempts.")
 
 
 async def drm_handler(bot: Client, m: Message):
@@ -704,22 +720,34 @@ async def drm_handler(bot: Client, m: Message):
                                 if status != 402:
                                     raise
 
-                                # The AppX signing endpoint returned 402.
-                                # Do NOT bypass it by rewriting the URL to the
-                                # underlying origin; that produces 403 and loses
-                                # the signing/authorization performed by the proxy.
-                                try:
-                                    proxy_body = response.text[:3000] if response is not None else ""
-                                except Exception:
-                                    proxy_body = ""
+                                # The signing host is only a proxy wrapper around
+                                # the AppX origin. If that proxy answers 402, try
+                                # the origin encoded in /appx/<host>/... using
+                                # the same signed query string. This does NOT
+                                # alter/re-sign the token.
+                                parsed = urlparse(original_url)
+                                parts = parsed.path.split("/")
+                                if len(parts) < 4 or parts[1].lower() != "appx" or not parts[2]:
+                                    raise RuntimeError(
+                                        "AppX signing proxy returned 402 and the underlying origin could not be parsed."
+                                    ) from proxy_err
 
-                                raise RuntimeError(
-                                    "AppX signing service returned HTTP 402 "
-                                    "(Payment Required). The signed AppX proxy "
-                                    "did not authorize this request. "
-                                    f"Response: {proxy_body}"
-                                ) from proxy_err
+                                origin_host = parts[2]
+                                origin_path = "/" + "/".join(parts[3:])
+                                origin_url = f"https://{origin_host}{origin_path}"
+                                if parsed.query:
+                                    origin_url += "?" + parsed.query
 
+                                print(
+                                    f"[AppX PDF] Signing proxy returned 402; trying authorized origin: {origin_host}",
+                                    flush=True,
+                                )
+                                resolved_url = _download_pdf_url(
+                                    origin_url,
+                                    output_pdf,
+                                    referer="https://appxsignurl.vercel.app/",
+                                )
+                                print(f"[AppX PDF] Origin resolved: {resolved_url}", flush=True)
                         elif "cwmediabkt99" in original_url:
                             scraper = cloudscraper.create_scraper()
                             response = scraper.get(
@@ -835,9 +863,16 @@ async def drm_handler(bot: Client, m: Message):
                     prog = await bot.send_message(channel_id, Show, disable_web_page_preview=True)
                     prog1 = await m.reply_text(Show1, disable_web_page_preview=True)
                     res_file = await helper.download_asia_video(url,  name)  
-                    filename = res_file  
+                    filename = res_file
+  
+                    if not filename or not isinstance(filename, (str, bytes, os.PathLike)) or not os.path.isfile(filename) or os.path.getsize(filename) <= 0:
+  
+                        raise RuntimeError("Downloader returned no valid output file.")
+  
                     await prog1.delete(True)
+  
                     await prog.delete(True)
+  
                     await helper.send_vid(bot, m, cc, filename, vidwatermark, thumb, name, prog, channel_id)
                     count += 1  
                     await asyncio.sleep(1)  
@@ -864,9 +899,16 @@ async def drm_handler(bot: Client, m: Message):
                     prog = await bot.send_message(channel_id, Show, disable_web_page_preview=True)
                     prog1 = await m.reply_text(Show1, disable_web_page_preview=True)
                     res_file = await helper.process_zip_to_video(url,  name)  
-                    filename = res_file  
+                    filename = res_file
+  
+                    if not filename or not isinstance(filename, (str, bytes, os.PathLike)) or not os.path.isfile(filename) or os.path.getsize(filename) <= 0:
+  
+                        raise RuntimeError("Downloader returned no valid output file.")
+  
                     await prog1.delete(True)
+  
                     await prog.delete(True)
+  
                     await helper.send_vid(bot, m, cc, filename, vidwatermark, thumb, name, prog, channel_id)
                     count += 1  
                     await asyncio.sleep(1)  
@@ -897,9 +939,16 @@ async def drm_handler(bot: Client, m: Message):
                     prog = await bot.send_message(channel_id, Show, disable_web_page_preview=True)
                     prog1 = await m.reply_text(Show1, disable_web_page_preview=True)
                     res_file = helper.download_and_decrypt_video(url, namef, appxkey)  
-                    filename = res_file  
+                    filename = res_file
+  
+                    if not filename or not isinstance(filename, (str, bytes, os.PathLike)) or not os.path.isfile(filename) or os.path.getsize(filename) <= 0:
+  
+                        raise RuntimeError("Downloader returned no valid output file.")
+  
                     await prog1.delete(True)
+  
                     await prog.delete(True)
+  
                     await helper.send_vid(bot, m, cc, filename, vidwatermark, thumb, name, prog, channel_id)
                     count += 1  
                     await asyncio.sleep(1)  
