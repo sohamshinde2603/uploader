@@ -88,114 +88,6 @@ async def download_youtube(url, ytf, name):
     except Exception as e:
         print(f"Error during YouTube download: {e}")
         return None
-def _first_url_from_appx_payload(payload):
-    """Return the first plausible media URL from an AppX JSON payload."""
-    preferred = (
-        "pdf_url", "download_url", "file_url", "media_url",
-        "video_url", "signed_url", "signedUrl", "url", "src", "path"
-    )
-    if isinstance(payload, dict):
-        for key in preferred:
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
-                return value.strip()
-        for value in payload.values():
-            found = _first_url_from_appx_payload(value)
-            if found:
-                return found
-    elif isinstance(payload, list):
-        for value in payload:
-            found = _first_url_from_appx_payload(value)
-            if found:
-                return found
-    elif isinstance(payload, str):
-        match = re.search(r'https?://[^\s"\'<>]+', payload)
-        if match:
-            return match.group(0).rstrip()
-    return None
-
-
-def _download_pdf_url(url, output_path, referer=None):
-    """Download a directly accessible PDF or follow a JSON URL response."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 12) "
-            "AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36"
-        ),
-        "Accept": "application/pdf,application/json,text/plain,*/*",
-    }
-    if referer:
-        headers["Referer"] = referer
-
-    session = requests.Session()
-    current = url.strip()
-
-    for _ in range(4):
-        response = session.get(
-            current,
-            headers=headers,
-            timeout=30,
-            allow_redirects=True,
-        )
-
-        # Preserve the exact server-side status.
-        if response.status_code >= 400:
-            try:
-                detail = response.text[:2000]
-            except Exception:
-                detail = ""
-            raise requests.HTTPError(
-                f"HTTP {response.status_code} for {current}: {detail}",
-                response=response,
-            )
-
-        content_type = (
-            response.headers.get("content-type") or ""
-        ).lower()
-        body = response.content
-
-        if body.startswith(b"%PDF-"):
-            with open(output_path, "wb") as fh:
-                fh.write(body)
-
-            if os.path.getsize(output_path) <= 0:
-                raise RuntimeError("AppX returned an empty PDF.")
-
-            return response.url
-
-        # Some AppX wrappers return JSON containing the actual URL.
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = None
-
-        if payload is not None:
-            next_url = _first_url_from_appx_payload(payload)
-            if next_url and next_url != current:
-                current = next_url
-                continue
-
-            if isinstance(payload, dict):
-                error = (
-                    payload.get("error")
-                    or payload.get("message")
-                    or payload.get("msg")
-                    or payload
-                )
-                raise RuntimeError(
-                    f"AppX PDF endpoint returned JSON but no PDF URL: {error}"
-                )
-
-        # Otherwise don't save HTML/text as a PDF.
-        raise RuntimeError(
-            "AppX PDF endpoint did not return a PDF. "
-            f"Content-Type={content_type}; "
-            f"first bytes={body[:80]!r}"
-        )
-
-    raise RuntimeError("Too many AppX PDF redirects/resolution attempts.")
-
-
 async def drm_handler(bot: Client, m: Message):
     globals.processing_request = True
     globals.cancel_requested = False
@@ -463,79 +355,9 @@ async def drm_handler(bot: Client, m: Message):
                     "url": f"{url}"
                 }
 
-                cp_response = requests.get(
-                    "https://api.classplusapp.com/cams/uploader/video/jw-signed-url",
-                    params=params,
-                    headers=headers,
-                    timeout=20,
-                )
-
-                print(
-                    f"[ClassPlus] HTTP {cp_response.status_code}",
-                    flush=True,
-                )
-                print(
-                    f"[ClassPlus] Response: {cp_response.text[:3000]}",
-                    flush=True,
-                )
-
-                try:
-                    cp_data = cp_response.json()
-                except ValueError:
-                    raise RuntimeError(
-                        f"ClassPlus returned non-JSON response "
-                        f"(HTTP {cp_response.status_code})"
-                    )
-
-                if not cp_response.ok:
-                    error = cp_data.get("error", cp_data) if isinstance(cp_data, dict) else cp_data
-                    if isinstance(error, dict):
-                        error = (
-                            error.get("message")
-                            or error.get("msg")
-                            or error.get("error")
-                            or str(error)
-                        )
-                    raise RuntimeError(
-                        f"ClassPlus API HTTP {cp_response.status_code}: {error}"
-                    )
-
-                signed_url = None
-                if isinstance(cp_data, dict):
-                    signed_url = (
-                        cp_data.get("url")
-                        or cp_data.get("video_url")
-                        or cp_data.get("signed_url")
-                        or cp_data.get("signedUrl")
-                    )
-                    data = cp_data.get("data")
-                    if not signed_url and isinstance(data, dict):
-                        signed_url = (
-                            data.get("url")
-                            or data.get("video_url")
-                            or data.get("signed_url")
-                            or data.get("signedUrl")
-                        )
-
-                if not isinstance(signed_url, str) or not signed_url.strip():
-                    error = cp_data.get("error", "No media URL returned") if isinstance(cp_data, dict) else str(cp_data)
-                    if isinstance(error, dict):
-                        error = (
-                            error.get("message")
-                            or error.get("msg")
-                            or error.get("error")
-                            or str(error)
-                        )
-                    raise RuntimeError(
-                        f"ClassPlus API returned no media URL: {error}"
-                    )
-
-                url = signed_url.strip()
-                print("[ClassPlus] Authorized media URL received.", flush=True)
-                # The returned URL is now the actual media URL used by the
-                # normal downloader below.
-                ytf = youtube_format(raw_text2)
-
+                res = requests.get("https://api.classplusapp.com/cams/uploader/video/jw-signed-url", params=params, headers=headers).json()
+                
+                
             if "edge.api.brightcove.com" in url:
                 bcov = f'bcov_auth={cwtoken}'
                 url = url.split("bcov_auth")[0]+bcov
@@ -616,11 +438,12 @@ async def drm_handler(bot: Client, m: Message):
             if "jw-prod" in url:
                 cmd = f'yt-dlp -o "{name}.mp4" "{url}"'
             elif "webvideos.classplusapp." in url:
-               cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" -f "{ytf}" "{url}" -o "{name}.mp4"'
+               format_arg = f'-f "{ytf}"' if ytf else ""
+               cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" {format_arg} "{url}" -o "{name}.%(ext)s"'
             elif "youtube.com" in url or "youtu.be" in url:
                 cmd = f'yt-dlp --cookies youtube_cookies.txt -f "{ytf}" "{url}" -o "{name}".mp4'
             else:
-                cmd = f'yt-dlp -f "{ytf}" "{url}" -o "{name}.mp4"'
+                cmd = f'yt-dlp "{url}" -o "{name}.%(ext)s"'
 
             try:
                 if m.text:
@@ -694,111 +517,206 @@ async def drm_handler(bot: Client, m: Message):
                     count+=1
                     os.remove(ka)
   
-                elif ".pdf" in url.lower():
-                    # ---------------------------------------------------------
-                    # PDF HANDLER
-                    # AppXSignURL may return JSON containing the real PDF URL,
-                    # or it may return the PDF itself. Do not pass the API URL
-                    # to yt-dlp and then blindly upload a missing filename.
-                    # ---------------------------------------------------------
+                elif ".pdf" in url:
+                    final_url = url
+                    need_referer = False
                     namef = name1
-                    output_pdf = f"{namef}.pdf"
-                    original_url = url.strip()
-
-                    try:
-                        if "appxsignurl.vercel.app/appx/" in original_url.lower():
-                            try:
-                                resolved_url = _download_pdf_url(
-                                    original_url,
-                                    output_pdf,
-                                    referer="https://appxsignurl.vercel.app/",
-                                )
-                                print(f"[AppX PDF] Proxy resolved: {resolved_url}", flush=True)
-                            except requests.HTTPError as proxy_err:
-                                response = getattr(proxy_err, "response", None)
-                                status = getattr(response, "status_code", None)
-                                if status != 402:
-                                    raise
-
-                                # The signing host is only a proxy wrapper around
-                                # the AppX origin. If that proxy answers 402, try
-                                # the origin encoded in /appx/<host>/... using
-                                # the same signed query string. This does NOT
-                                # alter/re-sign the token.
-                                parsed = urlparse(original_url)
-                                parts = parsed.path.split("/")
-                                if len(parts) < 4 or parts[1].lower() != "appx" or not parts[2]:
-                                    raise RuntimeError(
-                                        "AppX signing proxy returned 402 and the underlying origin could not be parsed."
-                                    ) from proxy_err
-
-                                origin_host = parts[2]
-                                origin_path = "/" + "/".join(parts[3:])
-                                origin_url = f"https://{origin_host}{origin_path}"
-                                if parsed.query:
-                                    origin_url += "?" + parsed.query
-
-                                print(
-                                    f"[AppX PDF] Signing proxy returned 402; trying authorized origin: {origin_host}",
-                                    flush=True,
-                                )
-                                resolved_url = _download_pdf_url(
-                                    origin_url,
-                                    output_pdf,
-                                    referer="https://appxsignurl.vercel.app/",
-                                )
-                                print(f"[AppX PDF] Origin resolved: {resolved_url}", flush=True)
-                        elif "cwmediabkt99" in original_url:
-                            scraper = cloudscraper.create_scraper()
-                            response = scraper.get(
-                                original_url.replace(" ", "%20"),
-                                headers={"Referer": "https://player.akamai.net.in/"},
-                                timeout=30,
-                            )
-                            response.raise_for_status()
-                            if not response.content.startswith(b"%PDF-"):
-                                raise RuntimeError(
-                                    f"CDN returned non-PDF content ({response.headers.get('content-type', 'unknown')})."
-                                )
-                            with open(output_pdf, "wb") as fh:
-                                fh.write(response.content)
-                        else:
-                            _download_pdf_url(
-                                original_url,
-                                output_pdf,
-                                referer="https://player.akamai.net.in/",
-                            )
-
-                        if not os.path.isfile(output_pdf):
-                            raise FileNotFoundError(
-                                f"PDF download completed without creating {output_pdf}"
-                            )
-                        if os.path.getsize(output_pdf) == 0:
-                            raise RuntimeError("Downloaded PDF is empty.")
-
-                        with open(output_pdf, "rb") as fh:
-                            if fh.read(5) != b"%PDF-":
-                                raise RuntimeError(
-                                    "Downloaded file is not a valid PDF (missing %PDF header)."
-                                )
-
-                        await bot.send_document(
-                            chat_id=channel_id,
-                            document=output_pdf,
-                            caption=cc1,
-                        )
-                        count += 1
-
-                    except FloodWait as e:
-                        await m.reply_text(str(e))
-                        await asyncio.sleep(e.x)
-                        continue
-                    finally:
+                    if "appxsignurl.vercel.app/appx/" in url.lower():
                         try:
-                            if os.path.exists(output_pdf):
-                                os.remove(output_pdf)
-                        except OSError:
-                            pass
+                            appx_url = url.strip()
+
+                            response = requests.get(
+                                appx_url,
+                                headers={
+                                    "User-Agent": (
+                                        "Mozilla/5.0 (Linux; Android 12) "
+                                        "AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36"
+                                    ),
+                                    "Accept": (
+                                        "application/pdf,application/json,"
+                                        "text/plain,*/*"
+                                    ),
+                                    "Referer": "https://appxsignurl.vercel.app/",
+                                },
+                                timeout=30,
+                                allow_redirects=True,
+                            )
+
+                            print(
+                                f"[AppXSignURL] HTTP {response.status_code}",
+                                flush=True,
+                            )
+
+                            if response.status_code >= 400:
+                                try:
+                                    detail = response.text[:3000]
+                                except Exception:
+                                    detail = ""
+
+                                raise RuntimeError(
+                                    f"AppXSignURL returned HTTP "
+                                    f"{response.status_code}: {detail}"
+                                )
+
+                            content_type = (
+                                response.headers.get("content-type") or ""
+                            ).lower()
+
+                            if (
+                                response.content.startswith(b"%PDF-")
+                                or "application/pdf" in content_type
+                            ):
+                                output_pdf = f"{name1}.pdf"
+                                with open(output_pdf, "wb") as fh:
+                                    fh.write(response.content)
+
+                                url = output_pdf
+                                namef = name1
+                                need_referer = False
+
+                            else:
+                                try:
+                                    data = response.json()
+                                except ValueError:
+                                    data = None
+
+                                pdf_url = None
+                                if isinstance(data, dict):
+                                    pdf_url = (
+                                        data.get("pdf_url")
+                                        or data.get("download_url")
+                                        or data.get("file_url")
+                                        or data.get("media_url")
+                                        or data.get("url")
+                                    )
+
+                                    nested = data.get("data")
+                                    if not pdf_url and isinstance(nested, dict):
+                                        pdf_url = (
+                                            nested.get("pdf_url")
+                                            or nested.get("download_url")
+                                            or nested.get("file_url")
+                                            or nested.get("media_url")
+                                            or nested.get("url")
+                                        )
+
+                                    namef = data.get("title", name1) or name1
+
+                                if not (
+                                    isinstance(pdf_url, str)
+                                    and pdf_url.strip()
+                                ):
+                                    raise RuntimeError(
+                                        "AppXSignURL returned neither a PDF "
+                                        "nor a downloadable PDF URL. "
+                                        f"Response: {data!r}"
+                                    )
+
+                                url = pdf_url.strip()
+                                need_referer = True
+
+                        except Exception as e:
+                            print(
+                                f"[AppXSignURL] PDF resolution failed: {e}",
+                                flush=True,
+                            )
+                            raise
+                    elif "static-db.appx.co.in" in url:
+                           
+                           need_referer = True
+                           namef = name1
+                    elif "static-db-v2.appx.co.in" in url:
+                           
+                           need_referer = True
+                           namef = name1
+
+                    elif "static-db-v2.appx.co.in" in url:
+                        filename = urlparse(url).path.split("/")[-1]
+                        url = f"https://appx-content-v2.classx.co.in/paid_course4/{filename}"
+                        need_referer = True
+                        namef = name1
+                    else:
+                        if topic == "/yes":
+                            namef = f'{v_name}'
+                        else:
+                            try:
+                                response = requests.get(url)
+                                if response.status_code == 200:
+                                    try:
+                                        data = response.json()
+                                        namef = data.get("title", name1).replace("nn", "")
+                                    except:
+                                        namef = name1
+                                else:
+                                    namef = name1
+                            except:
+                                namef = name1
+                        need_referer = True
+                    if "cwmediabkt99" in url:
+                        namef = name1
+                        max_retries = 15  # Define the maximum number of retries
+                        retry_delay = 4  # Delay between retries in seconds
+                        success = False  # To track whether the download was successful
+                        failure_msgs = []  # To keep track of failure messages
+                        
+                        for attempt in range(max_retries):
+                            try:
+                                await asyncio.sleep(retry_delay)
+                                url = url.replace(" ", "%20")
+                                scraper = cloudscraper.create_scraper()
+                                response = scraper.get(url)
+
+                                if response.status_code == 200:
+                                    with open(f'{namef}.pdf', 'wb') as file:
+                                        file.write(response.content)
+                                    await asyncio.sleep(retry_delay)  # Optional, to prevent spamming
+                                    copy = await bot.send_document(chat_id=channel_id, document=f'{namef}.pdf', caption=cc1)
+                                    count += 1
+                                    os.remove(f'{namef}.pdf')
+                                    success = True
+                                    break  # Exit the retry loop if successful
+                                else:
+                                    failure_msg = await m.reply_text(f"Attempt {attempt + 1}/{max_retries} failed: {response.status_code} {response.reason}")
+                                    failure_msgs.append(failure_msg)
+                                    
+                            except Exception as e:
+                                failure_msg = await m.reply_text(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                                failure_msgs.append(failure_msg)
+                                await asyncio.sleep(retry_delay)
+                                continue 
+                    else:
+                        namef = name1
+                        try:
+                            # -----------------------------------------
+                            if need_referer:
+                                referer = "https://player.akamai.net.in/"
+                                cmd = f'yt-dlp --add-header "Referer: {referer}" -o "{namef}.pdf" "{url}"'
+                            else:
+                                cmd = f'yt-dlp -o "{namef}.pdf" "{url}"'
+
+                            download_cmd = f"{cmd} -R 25 --fragment-retries 25"
+
+                            # -----------------------------------------
+                            # DOWNLOAD PDF
+                            # -----------------------------------------
+                            os.system(download_cmd)
+
+                            # -----------------------------------------
+                            # SEND PDF
+                            # -----------------------------------------
+                            copy = await bot.send_document(
+                                chat_id=channel_id,
+                                document=f"{namef}.pdf",
+                                caption=cc1
+                            )
+
+                            count += 1
+                            os.remove(f"{namef}.pdf")
+
+                        except FloodWait as e:
+                            await m.reply_text(str(e))
+                            time.sleep(e.x)
+                            continue
 
                 elif ".ws" in url and  url.endswith(".ws"):
                     try:
@@ -863,16 +781,9 @@ async def drm_handler(bot: Client, m: Message):
                     prog = await bot.send_message(channel_id, Show, disable_web_page_preview=True)
                     prog1 = await m.reply_text(Show1, disable_web_page_preview=True)
                     res_file = await helper.download_asia_video(url,  name)  
-                    filename = res_file
-  
-                    if not filename or not isinstance(filename, (str, bytes, os.PathLike)) or not os.path.isfile(filename) or os.path.getsize(filename) <= 0:
-  
-                        raise RuntimeError("Downloader returned no valid output file.")
-  
+                    filename = res_file  
                     await prog1.delete(True)
-  
                     await prog.delete(True)
-  
                     await helper.send_vid(bot, m, cc, filename, vidwatermark, thumb, name, prog, channel_id)
                     count += 1  
                     await asyncio.sleep(1)  
@@ -899,16 +810,9 @@ async def drm_handler(bot: Client, m: Message):
                     prog = await bot.send_message(channel_id, Show, disable_web_page_preview=True)
                     prog1 = await m.reply_text(Show1, disable_web_page_preview=True)
                     res_file = await helper.process_zip_to_video(url,  name)  
-                    filename = res_file
-  
-                    if not filename or not isinstance(filename, (str, bytes, os.PathLike)) or not os.path.isfile(filename) or os.path.getsize(filename) <= 0:
-  
-                        raise RuntimeError("Downloader returned no valid output file.")
-  
+                    filename = res_file  
                     await prog1.delete(True)
-  
                     await prog.delete(True)
-  
                     await helper.send_vid(bot, m, cc, filename, vidwatermark, thumb, name, prog, channel_id)
                     count += 1  
                     await asyncio.sleep(1)  
@@ -939,16 +843,9 @@ async def drm_handler(bot: Client, m: Message):
                     prog = await bot.send_message(channel_id, Show, disable_web_page_preview=True)
                     prog1 = await m.reply_text(Show1, disable_web_page_preview=True)
                     res_file = helper.download_and_decrypt_video(url, namef, appxkey)  
-                    filename = res_file
-  
-                    if not filename or not isinstance(filename, (str, bytes, os.PathLike)) or not os.path.isfile(filename) or os.path.getsize(filename) <= 0:
-  
-                        raise RuntimeError("Downloader returned no valid output file.")
-  
+                    filename = res_file  
                     await prog1.delete(True)
-  
                     await prog.delete(True)
-  
                     await helper.send_vid(bot, m, cc, filename, vidwatermark, thumb, name, prog, channel_id)
                     count += 1  
                     await asyncio.sleep(1)  
