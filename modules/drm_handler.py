@@ -61,13 +61,25 @@ def youtube_format(raw_text2):
 
 def _download_pdf_file(url, referer=None):
     """Download a direct PDF response (or a JSON wrapper containing pdf_url)."""
+    def check_status(response):
+        if response.status_code == 402:
+            raise ValueError(
+                "The PDF service returned HTTP 402 (Payment Required). "
+                "Check that service's account plan or usage quota."
+            )
+        if not response.ok:
+            raise ValueError(
+                f"The PDF source returned HTTP {response.status_code} "
+                f"({response.reason})."
+            )
+
     headers = {"User-Agent": "Mozilla/5.0"}
     if referer:
         headers["Referer"] = referer
 
     response = requests.get(url, headers=headers, stream=True, timeout=(20, 120))
     try:
-        response.raise_for_status()
+        check_status(response)
         content_type = response.headers.get("Content-Type", "").lower()
         if "json" in content_type:
             payload = response.json()
@@ -76,7 +88,7 @@ def _download_pdf_file(url, referer=None):
                 raise ValueError("The server returned JSON without a pdf_url.")
             response.close()
             response = requests.get(pdf_url, headers=headers, stream=True, timeout=(20, 120))
-            response.raise_for_status()
+            check_status(response)
 
         os.makedirs("downloads", exist_ok=True)
         fd, file_path = tempfile.mkstemp(prefix="document_", suffix=".pdf", dir="downloads")
@@ -841,7 +853,7 @@ async def drm_handler(bot: Client, m: Message):
                     time.sleep(1)
                 
             except Exception as e:
-                await bot.send_message(channel_id, f'⚠️**Downloading Failed**⚠️\n**Name** =>> `{str(count).zfill(3)} {name1}`\n**Url** =>> {url}\n\n<blockquote expandable><i><b>Failed Reason: {str(e)}</b></i></blockquote>', disable_web_page_preview=True)
+                await bot.send_message(channel_id, f'⚠️**Downloading Failed**⚠️\n**Name** =>> `{str(count).zfill(3)} {name1}`\n\n<blockquote expandable><i><b>Failed Reason: {str(e)}</b></i></blockquote>', disable_web_page_preview=True)
                 count += 1
                 failed_count += 1
                 continue
