@@ -45,6 +45,7 @@ import aiofiles
 import zipfile
 import shutil
 import ffmpeg
+import tempfile
 from urllib.parse import urlparse
 import base64
 
@@ -56,6 +57,49 @@ def youtube_format(raw_text2):
         f"bv*[height<={raw_text2}][ext=mp4]+ba[ext=m4a]/"
         f"b[height<={raw_text2}]"
     )
+
+
+def _download_pdf_file(url, referer=None):
+    """Download a direct PDF response (or a JSON wrapper containing pdf_url)."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if referer:
+        headers["Referer"] = referer
+
+    response = requests.get(url, headers=headers, stream=True, timeout=(20, 120))
+    try:
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "json" in content_type:
+            payload = response.json()
+            pdf_url = payload.get("pdf_url") if isinstance(payload, dict) else None
+            if not pdf_url:
+                raise ValueError("The server returned JSON without a pdf_url.")
+            response.close()
+            response = requests.get(pdf_url, headers=headers, stream=True, timeout=(20, 120))
+            response.raise_for_status()
+
+        os.makedirs("downloads", exist_ok=True)
+        fd, file_path = tempfile.mkstemp(prefix="document_", suffix=".pdf", dir="downloads")
+        os.close(fd)
+        try:
+            with open(file_path, "wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        output.write(chunk)
+
+            with open(file_path, "rb") as downloaded:
+                if downloaded.read(5) != b"%PDF-":
+                    raise ValueError(
+                        f"The server response was not a PDF (Content-Type: "
+                        f"{response.headers.get('Content-Type', 'unknown')})."
+                    )
+            return file_path
+        except Exception:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise
+    finally:
+        response.close()
 
 # ---------------------------------------------------------
 # YOUTUBE DOWNLOAD HANDLER (NO COOKIES)
@@ -522,29 +566,9 @@ async def drm_handler(bot: Client, m: Message):
                     need_referer = False
                     namef = name1
                     if "appxsignurl.vercel.app/appx/" in url:
-                        try:
-                            # Step 1: Directly use the original URL
-                            response = requests.get(url.strip(), timeout=10)
-                            data = response.json()
-
-                            # Step 2: Extract actual PDF URL
-                            pdf_url = data.get("pdf_url")
-                            if pdf_url:
-                                url = pdf_url.strip()   # overwrite with real downloadable link
-                            else:
-                                print("No pdf_url found in response JSON.")
-                                # fallback: keep original URL
-                                # url remains unchanged
-
-                            # Step 3: Extract title if available
-                            namef = data.get("title", name1)
-
-                            # Step 4: Mark referer requirement
-                            need_referer = True
-                        except Exception as e:
-                            print(f"Error fetching AppxSignURL JSON: {e}")
-                            need_referer = True
-                            namef = name1
+                        # This endpoint may return a PDF directly or a JSON wrapper.
+                        # _download_pdf_file handles both without treating the PDF as JSON.
+                        need_referer = True
                     
 
                     elif "static-db.appx.co.in" in url:
@@ -611,38 +635,18 @@ async def drm_handler(bot: Client, m: Message):
                                 await asyncio.sleep(retry_delay)
                                 continue 
                     else:
-                        namef = name1
+                        referer = "https://player.akamai.net.in/" if need_referer else None
+                        pdf_path = await asyncio.to_thread(_download_pdf_file, url, referer)
                         try:
-                            # -----------------------------------------
-                            if need_referer:
-                                referer = "https://player.akamai.net.in/"
-                                cmd = f'yt-dlp --add-header "Referer: {referer}" -o "{namef}.pdf" "{url}"'
-                            else:
-                                cmd = f'yt-dlp -o "{namef}.pdf" "{url}"'
-
-                            download_cmd = f"{cmd} -R 25 --fragment-retries 25"
-
-                            # -----------------------------------------
-                            # DOWNLOAD PDF
-                            # -----------------------------------------
-                            os.system(download_cmd)
-
-                            # -----------------------------------------
-                            # SEND PDF
-                            # -----------------------------------------
-                            copy = await bot.send_document(
+                            await bot.send_document(
                                 chat_id=channel_id,
-                                document=f"{namef}.pdf",
+                                document=pdf_path,
                                 caption=cc1
                             )
-
                             count += 1
-                            os.remove(f"{namef}.pdf")
-
-                        except FloodWait as e:
-                            await m.reply_text(str(e))
-                            time.sleep(e.x)
-                            continue
+                        finally:
+                            if os.path.exists(pdf_path):
+                                os.remove(pdf_path)
 
                 elif ".ws" in url and  url.endswith(".ws"):
                     try:
